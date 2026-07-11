@@ -2,15 +2,38 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { Plus, FolderOpen, ChevronDown } from "lucide-react";
-import { HeaderSearchBtn } from "@/app/components/shared/HeaderSearchBtn";
-import { listProjects, updateProject, deleteProject } from "@/app/lib/mikeApi";
-import { OwnerOnlyModal } from "@/app/components/shared/OwnerOnlyModal";
-import { useAuth } from "@/contexts/AuthContext";
-import type { MikeProject } from "@/app/components/shared/types";
+import { FolderOpen, ChevronDown } from "lucide-react";
+import {
+    listProjects,
+    updateProject,
+    deleteProject,
+} from "@/app/lib/mikeApi";
+import { OwnerOnlyPopup } from "@/app/components/popups/OwnerOnlyPopup";
+import { useAuth } from "@/app/contexts/AuthContext";
+import type { Project } from "@/app/components/shared/types";
 import { NewProjectModal } from "./NewProjectModal";
-import { ToolbarTabs } from "@/app/components/shared/ToolbarTabs";
-import { RowActions } from "@/app/components/shared/RowActions";
+import { ProjectDetailsModal } from "./ProjectDetailsModal";
+import { TableToolbar } from "@/app/components/shared/TableToolbar";
+import {
+    RowActionMenuItems,
+    RowActions,
+} from "@/app/components/shared/RowActions";
+import { PageHeader } from "@/app/components/shared/PageHeader";
+import {
+    TABLE_CHECKBOX_CLASS,
+    TABLE_STICKY_CELL_BG,
+    SkeletonDot,
+    SkeletonLine,
+    TableBody,
+    TableCell,
+    TableEmptyState,
+    TableHeaderCell,
+    TableHeaderRow,
+    TablePrimaryCell,
+    TableRow,
+    TableScrollArea,
+    TableStickyCell,
+} from "@/app/components/shared/TablePrimitive";
 
 function formatDate(iso: string) {
     return new Date(iso).toLocaleDateString(undefined, {
@@ -20,21 +43,24 @@ function formatDate(iso: string) {
     });
 }
 
-type Tab = "all" | "mine" | "shared-with-me";
+function getProjectOwnerLabel(project: Project, currentUserId?: string | null) {
+    if (project.is_owner ?? project.user_id === currentUserId) return "Me";
+    return (
+        project.owner_display_name?.trim() ||
+        project.owner_email?.trim() ||
+        "Shared"
+    );
+}
 
-const CHECK_W = "w-8 shrink-0";
-const NAME_COL_W = "w-[300px] shrink-0";
+type ProjectFilter = "all" | "mine" | "shared-with-me";
 
 export function ProjectsOverview() {
-    const [projects, setProjects] = useState<MikeProject[]>([]);
+    const [projects, setProjects] = useState<Project[]>([]);
     const [loading, setLoading] = useState(true);
     const [loadError, setLoadError] = useState<string | null>(null);
     const [modalOpen, setModalOpen] = useState(false);
-    const [activeTab, setActiveTab] = useState<Tab>("all");
-    const [renamingId, setRenamingId] = useState<string | null>(null);
-    const [renameValue, setRenameValue] = useState("");
-    const [cmEditingId, setCmEditingId] = useState<string | null>(null);
-    const [cmValue, setCmValue] = useState("");
+    const [detailsProject, setDetailsProject] = useState<Project | null>(null);
+    const [activeFilter, setActiveFilter] = useState<ProjectFilter>("all");
     const [selectedIds, setSelectedIds] = useState<string[]>([]);
     const [actionsOpen, setActionsOpen] = useState(false);
     const [search, setSearch] = useState("");
@@ -44,43 +70,44 @@ export function ProjectsOverview() {
     const { user, isAuthenticated, authLoading } = useAuth();
 
     useEffect(() => {
-        if (authLoading) {
-            setLoading(true);
-            return;
-        }
-        if (!isAuthenticated) {
-            setProjects([]);
-            setLoadError(null);
-            setLoading(false);
-            return;
-        }
-
         let cancelled = false;
-        setLoading(true);
-        setLoadError(null);
-        listProjects()
-            .then((loaded) => {
+
+        async function loadProjects() {
+            await Promise.resolve();
+            if (cancelled) return;
+            if (authLoading) {
+                setLoading(true);
+                return;
+            }
+            if (!isAuthenticated) {
+                setProjects([]);
+                setLoadError(null);
+                setLoading(false);
+                return;
+            }
+
+            setLoading(true);
+            setLoadError(null);
+            try {
+                const loaded = await listProjects();
                 if (!cancelled) setProjects(loaded);
-            })
-            .catch((err) => {
+            } catch (err) {
                 console.error("[projects] failed to load projects", err);
                 if (!cancelled) {
                     setProjects([]);
                     setLoadError("Could not load projects.");
                 }
-            })
-            .finally(() => {
+            } finally {
                 if (!cancelled) setLoading(false);
-            });
+            }
+        }
+
+        void loadProjects();
 
         return () => {
             cancelled = true;
         };
     }, [authLoading, isAuthenticated, user?.id]);
-
-    useEffect(() => {
-        setSelectedIds([]);
-    }, [activeTab]);
 
     useEffect(() => {
         function handleClick(e: MouseEvent) {
@@ -96,16 +123,17 @@ export function ProjectsOverview() {
 
     const q = search.toLowerCase();
     const filtered = (
-        activeTab === "all"
+        activeFilter === "all"
             ? projects
-            : activeTab === "mine"
+            : activeFilter === "mine"
               ? projects.filter((p) => p.is_owner ?? p.user_id === user?.id)
               : projects.filter((p) => !(p.is_owner ?? p.user_id === user?.id))
     ).filter(
         (p) =>
             !q ||
             p.name.toLowerCase().includes(q) ||
-            (p.cm_number ?? "").toLowerCase().includes(q),
+            (p.cm_number ?? "").toLowerCase().includes(q) ||
+            (p.practice ?? "").toLowerCase().includes(q),
     );
 
     const allSelected =
@@ -128,31 +156,42 @@ export function ProjectsOverview() {
         );
     }
 
-    const tabs: { id: Tab; label: string }[] = [
+    const filters: { id: ProjectFilter; label: string }[] = [
         { id: "all", label: "All" },
         { id: "mine", label: "Mine" },
         { id: "shared-with-me", label: "Shared with me" },
     ];
 
-    async function handleRenameSubmit(projectId: string) {
-        const trimmed = renameValue.trim();
-        setRenamingId(null);
-        if (!trimmed) return;
+    async function handleProjectDetailsSave(values: {
+        name: string;
+        cmNumber: string;
+        practice: string;
+    }) {
+        if (!detailsProject) return;
+        if (
+            detailsProject.is_owner === false ||
+            (user?.id && detailsProject.user_id !== user.id)
+        ) {
+            setOwnerOnlyAction("edit project details");
+            return;
+        }
+        const name = values.name.trim();
+        const cmNumber = values.cmNumber.trim();
+        const practice = values.practice.trim();
+        if (!name) return;
+        const updated = await updateProject(detailsProject.id, {
+            name,
+            cm_number: cmNumber,
+            practice: practice || null,
+        });
         setProjects((prev) =>
-            prev.map((p) => (p.id === projectId ? { ...p, name: trimmed } : p)),
-        );
-        await updateProject(projectId, { name: trimmed });
-    }
-
-    async function handleCmSubmit(projectId: string) {
-        const trimmed = cmValue.trim();
-        setCmEditingId(null);
-        setProjects((prev) =>
-            prev.map((p) =>
-                p.id === projectId ? { ...p, cm_number: trimmed || null } : p,
+            prev.map((project) =>
+                project.id === updated.id ? { ...project, ...updated } : project,
             ),
         );
-        await updateProject(projectId, { cm_number: trimmed || undefined });
+        setDetailsProject((current) =>
+            current?.id === updated.id ? { ...current, ...updated } : current,
+        );
     }
 
     async function handleDeleteSelected() {
@@ -160,7 +199,7 @@ export function ProjectsOverview() {
         setActionsOpen(false);
         // Only the project owner can delete; the per-row delete is hidden
         // for shared projects but the bulk action can still pick them up
-        // if a user toggled them across tabs. Filter and warn.
+        // if a user toggled them across filters. Filter and warn.
         const owned = ids.filter((id) => {
             const p = projects.find((pp) => pp.id === id);
             return !p || (p.is_owner ?? p.user_id === user?.id);
@@ -177,7 +216,7 @@ export function ProjectsOverview() {
     }
 
     const toolbarActions = (
-        <div className="flex items-center gap-2">
+        <>
             {selectedIds.length > 0 && (
                 <div ref={actionsRef} className="relative">
                     <button
@@ -199,101 +238,118 @@ export function ProjectsOverview() {
                     )}
                 </div>
             )}
-        </div>
+        </>
     );
 
     return (
-        <div className="flex-1 overflow-y-auto bg-white">
+        <div className="flex h-full min-h-0 flex-1 flex-col overflow-hidden">
             {/* Page header */}
-            <div className="flex items-center justify-between px-8 py-4">
+            <PageHeader
+                loading={loading}
+                actions={[
+                    {
+                        type: "search",
+                        value: search,
+                        onChange: setSearch,
+                        placeholder: "Search projects…",
+                    },
+                    {
+                        type: "new",
+                        onClick: () => setModalOpen(true),
+                        title: "New project",
+                    },
+                ]}
+            >
                 <h1 className="text-2xl font-medium font-serif text-gray-900">
                     Projects
                 </h1>
-                <div className="flex items-center gap-2">
-                    <HeaderSearchBtn
-                        value={search}
-                        onChange={setSearch}
-                        placeholder="Search projects…"
-                    />
-                    <button
-                        onClick={() => setModalOpen(true)}
-                        className="flex items-center justify-center p-1.5 text-gray-500 hover:text-gray-900 transition-colors"
-                    >
-                        <Plus className="h-4 w-4" />
-                    </button>
-                </div>
-            </div>
+            </PageHeader>
 
-            <ToolbarTabs
-                tabs={tabs}
-                active={activeTab}
-                onChange={setActiveTab}
+            <TableToolbar
+                items={filters}
+                active={activeFilter}
+                onChange={(nextFilter) => {
+                    setActiveFilter(nextFilter);
+                    setSelectedIds([]);
+                }}
                 actions={toolbarActions}
             />
 
             {/* Table */}
-            <div className="w-full overflow-x-auto">
-                <div className="min-w-max">
-                {/* Column headers */}
-                <div className="flex items-center h-8 pr-8 border-b border-gray-200 text-xs text-gray-500 font-medium select-none">
-                    <div className={`sticky left-0 z-[60] ${CHECK_W} relative bg-white flex items-center justify-center self-stretch before:absolute before:inset-x-0 before:bottom-0 before:h-px before:bg-white`}>
-                        {!loading && (
-                            <input
-                                type="checkbox"
-                                checked={allSelected}
-                                ref={(el) => {
-                                    if (el) el.indeterminate = someSelected;
-                                }}
-                                onChange={toggleAll}
-                                className="h-2.5 w-2.5 rounded border-gray-200 cursor-pointer accent-black"
-                            />
-                        )}
-                    </div>
-                    <div className={`sticky left-8 z-[60] ${NAME_COL_W} bg-white pl-2 text-left`}>
-                        Name
-                    </div>
-                    <div className="ml-auto w-32 shrink-0 text-left">CM</div>
-                    <div className="w-24 shrink-0 text-left">Files</div>
-                    <div className="w-24 shrink-0 text-left">Chats</div>
-                    <div className="w-36 shrink-0 text-left">
-                        Tabular Reviews
-                    </div>
-                    <div className="w-32 shrink-0 text-left">Created</div>
-                    <div className="w-8 shrink-0" />
-                </div>
+            <TableScrollArea
+                header={
+                    <TableHeaderRow>
+                        <TableStickyCell header>
+                            {loading ? (
+                                <SkeletonDot />
+                            ) : (
+                                <input
+                                    type="checkbox"
+                                    checked={allSelected}
+                                    ref={(el) => {
+                                        if (el) el.indeterminate = someSelected;
+                                    }}
+                                    onChange={toggleAll}
+                                    className={TABLE_CHECKBOX_CLASS}
+                                />
+                            )}
+                            <span>Name</span>
+                        </TableStickyCell>
+                        <TableHeaderCell className="ml-auto w-32">CM</TableHeaderCell>
+                        <TableHeaderCell className="w-36">Practice</TableHeaderCell>
+                        <TableHeaderCell className="w-32">Owner</TableHeaderCell>
+                        <TableHeaderCell className="w-24">Files</TableHeaderCell>
+                        <TableHeaderCell className="w-24">Chats</TableHeaderCell>
+                        <TableHeaderCell className="w-36">
+                            Tabular Reviews
+                        </TableHeaderCell>
+                        <TableHeaderCell className="w-32">Created</TableHeaderCell>
+                        <TableHeaderCell className="w-8" />
+                    </TableHeaderRow>
+                }
+            >
 
                 {loading ? (
-                    <div>
+                    <TableBody>
                         {[1, 2, 3].map((i) => (
-                            <div
+                            <TableRow
                                 key={i}
-                                className="flex items-center h-10 pr-8 border-b border-gray-50"
+                                interactive={false}
                             >
-                                <div className="w-8 shrink-0" />
-                                <div className="flex-1 min-w-0 pl-3 pr-4">
-                                    <div className="h-3.5 w-48 rounded bg-gray-100 animate-pulse" />
-                                </div>
-                                <div className="w-32 shrink-0">
-                                    <div className="h-3 w-20 rounded bg-gray-100 animate-pulse" />
-                                </div>
-                                <div className="w-24 shrink-0">
-                                    <div className="h-3 w-8 rounded bg-gray-100 animate-pulse" />
-                                </div>
-                                <div className="w-24 shrink-0">
-                                    <div className="h-3 w-8 rounded bg-gray-100 animate-pulse" />
-                                </div>
-                                <div className="w-36 shrink-0">
-                                    <div className="h-3 w-8 rounded bg-gray-100 animate-pulse" />
-                                </div>
-                                <div className="w-32 shrink-0">
-                                    <div className="h-3 w-20 rounded bg-gray-100 animate-pulse" />
-                                </div>
-                                <div className="w-8 shrink-0" />
-                            </div>
+                                <TableStickyCell
+                                    hover={false}
+                                    bgClassName="bg-transparent"
+                                >
+                                    <SkeletonDot />
+                                    <SkeletonLine className="h-3.5 w-48" />
+                                </TableStickyCell>
+                                <TableCell className="ml-auto w-32">
+                                    <SkeletonLine className="w-20" />
+                                </TableCell>
+                                <TableCell className="w-36">
+                                    <SkeletonLine className="w-20" />
+                                </TableCell>
+                                <TableCell className="w-32">
+                                    <SkeletonLine className="w-16" />
+                                </TableCell>
+                                <TableCell className="w-24">
+                                    <SkeletonLine className="w-8" />
+                                </TableCell>
+                                <TableCell className="w-24">
+                                    <SkeletonLine className="w-8" />
+                                </TableCell>
+                                <TableCell className="w-36">
+                                    <SkeletonLine className="w-8" />
+                                </TableCell>
+                                <TableCell className="w-32">
+                                    <SkeletonLine className="w-20" />
+                                </TableCell>
+                                <TableCell className="w-8" />
+                            </TableRow>
                         ))}
-                    </div>
+                    </TableBody>
                 ) : loadError ? (
-                    <div className="flex flex-col items-start py-24 w-full max-w-xs mx-auto">
+                    <TableEmptyState>
                         <FolderOpen className="h-8 w-8 text-gray-300 mb-4" />
                         <p className="text-2xl font-medium font-serif text-gray-900">
                             Projects
@@ -301,10 +357,10 @@ export function ProjectsOverview() {
                         <p className="mt-1 text-xs text-red-500 max-w-xs">
                             {loadError}
                         </p>
-                    </div>
+                    </TableEmptyState>
                 ) : filtered.length === 0 ? (
-                    <div className="flex flex-col items-start py-24 w-full max-w-xs mx-auto">
-                        {activeTab === "all" || activeTab === "mine" ? (
+                    <TableEmptyState>
+                        {activeFilter === "all" || activeFilter === "mine" ? (
                             <>
                                 <FolderOpen className="h-8 w-8 text-gray-300 mb-4" />
                                 <p className="text-2xl font-medium font-serif text-gray-900">
@@ -324,112 +380,87 @@ export function ProjectsOverview() {
                             </>
                         ) : (
                             <p className="text-sm text-gray-400">
-                                No {activeTab} projects
+                                No {activeFilter} projects
                             </p>
                         )}
-                    </div>
+                    </TableEmptyState>
                 ) : (
-                    <div>
+                    <TableBody>
                         {filtered.map((project) => {
                             const rowBg = selectedIds.includes(project.id)
                                 ? "bg-gray-50"
-                                : "bg-white";
+                                : TABLE_STICKY_CELL_BG;
                             return (
-                            <div
+                            <TableRow
                                 key={project.id}
+                                rightClickDropdown={
+                                    (project.is_owner ??
+                                        project.user_id === user?.id)
+                                        ? (close) => (
+                                              <RowActionMenuItems
+                                                  onClose={close}
+                                                  onEditDetails={() => {
+                                                      setDetailsProject(project);
+                                                  }}
+                                                  onDelete={async () => {
+                                                      await deleteProject(
+                                                          project.id,
+                                                      );
+                                                      setProjects((prev) =>
+                                                          prev.filter(
+                                                              (p) =>
+                                                                  p.id !==
+                                                                  project.id,
+                                                          ),
+                                                      );
+                                                  }}
+                                              />
+                                          )
+                                        : undefined
+                                }
                                 onClick={() => {
-                                    if (renamingId === project.id) return;
                                     router.push(`/projects/${project.id}`);
                                 }}
-                                className="group flex items-center h-10 pr-8 border-b border-gray-50 hover:bg-gray-50 cursor-pointer transition-colors"
                             >
-                                <div
-                                    className={`sticky left-0 z-[60] ${CHECK_W} p-2 flex items-center justify-center ${rowBg} group-hover:bg-gray-50`}
-                                    onClick={(e) => e.stopPropagation()}
-                                >
-                                    <input
-                                        type="checkbox"
-                                        checked={selectedIds.includes(
-                                            project.id,
-                                        )}
-                                        onChange={() => toggleOne(project.id)}
-                                        className="h-2.5 w-2.5 rounded border-gray-200 cursor-pointer accent-black"
-                                    />
-                                </div>
-
                                 {/* Project Name */}
-                                <div className={`sticky left-8 z-[60] ${NAME_COL_W} p-2 ${rowBg} group-hover:bg-gray-50`}>
-                                    {renamingId === project.id ? (
-                                        <input
-                                            autoFocus
-                                            value={renameValue}
-                                            onChange={(e) =>
-                                                setRenameValue(e.target.value)
-                                            }
-                                            onKeyDown={(e) => {
-                                                if (e.key === "Enter")
-                                                    handleRenameSubmit(
-                                                        project.id,
-                                                    );
-                                                if (e.key === "Escape")
-                                                    setRenamingId(null);
-                                            }}
-                                            onBlur={() =>
-                                                handleRenameSubmit(project.id)
-                                            }
-                                            onClick={(e) => e.stopPropagation()}
-                                            className="w-full text-sm text-gray-800 bg-transparent outline-none"
-                                        />
-                                    ) : (
-                                        <span className="text-sm text-gray-800 truncate block">
-                                            {project.name}
+                                <TablePrimaryCell
+                                    bgClassName={rowBg}
+                                    selected={selectedIds.includes(project.id)}
+                                    onSelectionChange={() =>
+                                        toggleOne(project.id)
+                                    }
+                                    label={project.name}
+                                />
+
+                                <TableCell className="ml-auto w-32">
+                                    {project.cm_number ?? (
+                                        <span className="text-gray-300">
+                                            —
                                         </span>
                                     )}
-                                </div>
-
-                                <div
-                                    className="ml-auto w-32 shrink-0 text-sm text-gray-500 truncate"
-                                    onClick={(e) => e.stopPropagation()}
-                                >
-                                    {cmEditingId === project.id ? (
-                                        <input
-                                            autoFocus
-                                            value={cmValue}
-                                            onChange={(e) =>
-                                                setCmValue(e.target.value)
-                                            }
-                                            onKeyDown={(e) => {
-                                                if (e.key === "Enter")
-                                                    handleCmSubmit(project.id);
-                                                if (e.key === "Escape")
-                                                    setCmEditingId(null);
-                                            }}
-                                            onBlur={() =>
-                                                handleCmSubmit(project.id)
-                                            }
-                                            placeholder="CM #"
-                                            className="w-full text-sm text-gray-800 bg-transparent outline-none"
-                                        />
-                                    ) : (
-                                        (project.cm_number ?? (
-                                            <span className="text-gray-300">
-                                                —
-                                            </span>
-                                        ))
+                                </TableCell>
+                                <TableCell className="w-36">
+                                    {project.practice ?? (
+                                        <span className="text-gray-300">
+                                            —
+                                        </span>
                                     )}
-                                </div>
-                                <div className="w-24 shrink-0 text-sm text-gray-500 truncate">
+                                </TableCell>
+                                <TableCell className="w-32">
+                                    {getProjectOwnerLabel(project, user?.id)}
+                                </TableCell>
+                                <TableCell className="w-24">
                                     {project.document_count ?? 0}
-                                </div>
-                                <div className="w-24 shrink-0 text-sm text-gray-500 truncate">
+                                </TableCell>
+                                <TableCell className="w-24">
                                     {project.chat_count ?? 0}
-                                </div>
-                                <div className="w-36 shrink-0 text-sm text-gray-500 truncate">
+                                </TableCell>
+                                <TableCell className="w-36">
                                     {project.review_count ?? 0}
-                                </div>
-                                <div className="w-32 shrink-0 text-sm text-gray-500 truncate">
+                                </TableCell>
+                                <TableCell className="w-32">
                                     {formatDate(project.created_at)}
-                                </div>
+                                </TableCell>
 
                                 <div
                                     className="w-8 shrink-0 flex justify-end"
@@ -438,15 +469,8 @@ export function ProjectsOverview() {
                                     {(project.is_owner ??
                                         project.user_id === user?.id) && (
                                         <RowActions
-                                            onRename={() => {
-                                                setRenameValue(project.name);
-                                                setRenamingId(project.id);
-                                            }}
-                                            onUpdateCmNumber={() => {
-                                                setCmValue(
-                                                    project.cm_number ?? "",
-                                                );
-                                                setCmEditingId(project.id);
+                                            onEditDetails={() => {
+                                                setDetailsProject(project);
                                             }}
                                             onDelete={async () => {
                                                 await deleteProject(project.id);
@@ -460,13 +484,12 @@ export function ProjectsOverview() {
                                         />
                                     )}
                                 </div>
-                            </div>
+                            </TableRow>
                             );
                         })}
-                    </div>
+                    </TableBody>
                 )}
-            </div>
-            </div>
+            </TableScrollArea>
 
             <NewProjectModal
                 open={modalOpen}
@@ -477,7 +500,19 @@ export function ProjectsOverview() {
                 }}
             />
 
-            <OwnerOnlyModal
+            <ProjectDetailsModal
+                open={!!detailsProject}
+                project={detailsProject}
+                canEdit={
+                    !!detailsProject &&
+                    detailsProject.is_owner !== false &&
+                    (!user?.id || detailsProject.user_id === user.id)
+                }
+                onClose={() => setDetailsProject(null)}
+                onSave={handleProjectDetailsSave}
+            />
+
+            <OwnerOnlyPopup
                 open={!!ownerOnlyAction}
                 action={ownerOnlyAction ?? undefined}
                 onClose={() => setOwnerOnlyAction(null)}

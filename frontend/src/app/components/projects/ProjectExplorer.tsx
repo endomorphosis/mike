@@ -2,8 +2,6 @@
 
 import { useEffect, useRef, useState } from "react";
 import {
-    FileText,
-    File,
     Folder,
     FolderOpen,
     ChevronRight,
@@ -11,15 +9,19 @@ import {
     FolderPlus,
     Trash2,
 } from "lucide-react";
-import type { MikeDocument, MikeFolder } from "@/app/components/shared/types";
+import type {
+    Document,
+    Folder as ProjectFolder,
+} from "@/app/components/shared/types";
 import { VersionChip } from "@/app/components/shared/VersionChip";
+import { FileTypeIcon } from "@/app/components/shared/FileTypeIcon";
 
 interface Props {
     projectName?: string | null;
-    documents: MikeDocument[];
-    folders?: MikeFolder[];
+    documents: Document[];
+    folders?: ProjectFolder[];
     selectedDocId?: string | null;
-    onDocClick: (doc: MikeDocument) => void;
+    onDocClick: (doc: Document) => void;
     onCreateFolder?: (parentFolderId: string | null, name: string) => Promise<void>;
     onRenameFolder?: (folderId: string, name: string) => Promise<void>;
     onDeleteFolder?: (folderId: string) => Promise<void>;
@@ -29,11 +31,7 @@ interface Props {
 }
 
 function DocIcon({ fileType }: { fileType: string | null }) {
-    if (fileType === "pdf")
-        return <FileText className="h-3.5 w-3.5 text-red-500 shrink-0" />;
-    if (fileType === "docx" || fileType === "doc")
-        return <File className="h-3.5 w-3.5 text-blue-500 shrink-0" />;
-    return <File className="h-3.5 w-3.5 text-gray-400 shrink-0" />;
+    return <FileTypeIcon fileType={fileType} className="h-3.5 w-3.5" />;
 }
 
 type ContextMenuState = {
@@ -131,7 +129,7 @@ export function ProjectExplorer({
     }
 
     function wouldCreateCycle(movingId: string, targetId: string): boolean {
-        let cur: MikeFolder | undefined = folders.find((f) => f.id === targetId);
+        let cur: ProjectFolder | undefined = folders.find((f) => f.id === targetId);
         while (cur) {
             if (cur.id === movingId) return true;
             if (!cur.parent_folder_id) break;
@@ -299,8 +297,15 @@ export function ProjectExplorer({
                             style={{ paddingLeft: basePadding }}
                         >
                             <DocIcon fileType={doc.file_type} />
-                            <span className="text-xs truncate">{doc.filename}</span>
-                            <VersionChip n={doc.latest_version_number} />
+                            <span className="text-xs truncate">
+                                {doc.filename}
+                            </span>
+                            <VersionChip
+                                n={
+                                    doc.active_version_number ??
+                                    doc.latest_version_number
+                                }
+                            />
                         </li>
                     );
                 })}

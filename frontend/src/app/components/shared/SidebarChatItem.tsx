@@ -7,14 +7,15 @@ import {
     DropdownMenuContent,
     DropdownMenuItem,
     DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
+} from "@/app/components/ui/dropdown-menu";
 import { useChatHistoryContext } from "@/app/contexts/ChatHistoryContext";
-import { useAuth } from "@/contexts/AuthContext";
-import { OwnerOnlyModal } from "@/app/components/shared/OwnerOnlyModal";
-import type { MikeChat } from "@/app/components/shared/types";
+import { useAuth } from "@/app/contexts/AuthContext";
+import { OwnerOnlyPopup } from "@/app/components/popups/OwnerOnlyPopup";
+import type { Chat } from "@/app/components/shared/types";
+import { cn } from "@/app/lib/utils";
 
 interface Props {
-    chat: MikeChat;
+    chat: Chat;
     isActive: boolean;
     onSelect: () => void;
     projectName?: string;
@@ -48,9 +49,10 @@ export function SidebarChatItem({ chat, isActive, onSelect, projectName }: Props
 
     return (
         <div
-            className={`group relative flex items-center w-full h-9 rounded-md transition-colors ${
-                isActive ? "bg-gray-100" : "hover:bg-gray-100"
-            }`}
+            className={cn(
+                "group relative flex items-center w-full h-9 rounded-md transition-colors",
+                isActive ? "bg-gray-200/60" : "hover:bg-gray-100",
+            )}
         >
             {isRenaming ? (
                 <div className="flex items-center w-full px-2 py-1">
@@ -104,7 +106,7 @@ export function SidebarChatItem({ chat, isActive, onSelect, projectName }: Props
                     <DropdownMenu>
                         <DropdownMenuTrigger asChild>
                             <button
-                                className={`p-1 mr-1 text-gray-500 transition-opacity hover:text-gray-900 ${
+                                className={`mr-1 rounded-md p-1 text-gray-500 transition-all hover:bg-gray-200 hover:text-gray-900 ${
                                     isActive
                                         ? "opacity-100"
                                         : "opacity-0 group-hover:opacity-100"
@@ -144,7 +146,7 @@ export function SidebarChatItem({ chat, isActive, onSelect, projectName }: Props
                     </DropdownMenu>
                 </>
             )}
-            <OwnerOnlyModal
+            <OwnerOnlyPopup
                 open={!!ownerOnlyAction}
                 action={ownerOnlyAction ?? undefined}
                 onClose={() => setOwnerOnlyAction(null)}

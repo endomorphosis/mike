@@ -11,6 +11,7 @@ import { tabularRouter } from "./routes/tabular";
 import { workflowsRouter } from "./routes/workflows";
 import { userRouter } from "./routes/user";
 import { downloadsRouter } from "./routes/downloads";
+import { caseLawRouter } from "./routes/caseLaw";
 
 const app = express();
 const PORT = process.env.PORT ?? 3001;
@@ -71,12 +72,34 @@ const uploadLimiter = makeLimiter({
   message: "Too many upload requests. Please try again later.",
 });
 
+const exportLimiter = makeLimiter({
+  windowMs: hours(envInt("RATE_LIMIT_EXPORT_WINDOW_HOURS", 1)),
+  max: envInt("RATE_LIMIT_EXPORT_MAX", 10),
+  message: "Too many export requests. Please try again later.",
+});
+
+const dataDeleteLimiter = makeLimiter({
+  windowMs: hours(envInt("RATE_LIMIT_DATA_DELETE_WINDOW_HOURS", 1)),
+  max: envInt("RATE_LIMIT_DATA_DELETE_MAX", 20),
+  message: "Too many data deletion requests. Please try again later.",
+});
+
+function jsonLimitForPath(path: string): string {
+  return "50mb";
+}
+
 app.disable("x-powered-by");
 app.set("trust proxy", envInt("TRUST_PROXY_HOPS", 1));
 
 app.use(
   helmet({
-    contentSecurityPolicy: false,
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'none'"],
+        baseUri: ["'none'"],
+        frameAncestors: ["'none'"],
+      },
+    },
     crossOriginEmbedderPolicy: false,
     hsts: isProduction
       ? {
@@ -97,8 +120,6 @@ app.use(
 
 app.use(generalLimiter);
 
-app.use(express.json({ limit: "50mb" }));
-
 app.post("/chat", chatLimiter);
 app.post("/projects/:projectId/chat", chatLimiter);
 app.post("/tabular-review/:reviewId/chat", chatLimiter);
@@ -107,7 +128,22 @@ app.post("/chat/create", chatCreateLimiter);
 app.post("/chat/:chatId/generate-title", chatCreateLimiter);
 app.post("/single-documents", uploadLimiter);
 app.post("/single-documents/:documentId/versions", uploadLimiter);
+app.put(
+  "/single-documents/:documentId/versions/:versionId/file",
+  uploadLimiter,
+);
 app.post("/projects/:projectId/documents", uploadLimiter);
+app.get("/user/export", exportLimiter);
+app.get("/user/chats/export", exportLimiter);
+app.get("/user/tabular-reviews/export", exportLimiter);
+app.delete("/user/account", dataDeleteLimiter);
+app.delete("/user/chats", dataDeleteLimiter);
+app.delete("/user/projects", dataDeleteLimiter);
+app.delete("/user/tabular-reviews", dataDeleteLimiter);
+
+app.use((req, res, next) =>
+  express.json({ limit: jsonLimitForPath(req.path) })(req, res, next),
+);
 
 app.use("/chat", chatRouter);
 app.use("/projects", projectsRouter);
@@ -118,6 +154,7 @@ app.use("/workflows", workflowsRouter);
 app.use("/user", userRouter);
 app.use("/users", userRouter);
 app.use("/download", downloadsRouter);
+app.use("/case-law", caseLawRouter);
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
 

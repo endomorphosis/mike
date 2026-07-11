@@ -2,14 +2,28 @@ import { Router } from "express";
 import { requireAuth } from "../middleware/auth";
 import { createServerSupabase } from "../lib/supabase";
 import { downloadFile } from "../lib/storage";
-import { loadActiveVersion } from "../lib/documentVersions";
-import { normalizeDocxZipPaths } from "../lib/convert";
 import {
+    attachActiveVersionPaths,
+    loadActiveVersion,
+} from "../lib/documentVersions";
+import { docxToPdf, normalizeDocxZipPaths } from "../lib/convert";
+import {
+    isPresentationDocumentType,
+    isSpreadsheetDocumentType,
+    isWordDocumentType,
+} from "../lib/documentTypes";
+import { extractPresentationText } from "../lib/officeText";
+import { spreadsheetToLLMText } from "../lib/spreadsheet";
+import {
+    AssistantStreamError,
+    buildCancelledAssistantMessage,
+    isAbortError,
     runLLMStream,
+    stripTransientAssistantEvents,
     TABULAR_TOOLS,
     type ChatMessage,
     type TabularCellStore,
-} from "../lib/chatTools";
+} from "../lib/chat";
 import {
     completeText,
     providerForModel,
@@ -22,8 +36,12 @@ import {
     checkProjectAccess,
     ensureReviewAccess,
     filterAccessibleDocumentIds,
-    listAccessibleProjectIds,
 } from "../lib/access";
+import { safeErrorLog, safeErrorMessage } from "../lib/safeError";
+import {
+    findMissingUserEmails,
+    loadProfileUsersByEmail,
+} from "../lib/userLookup";
 
 function formatPromptSuffix(format?: string, tags?: string[]): string {
     switch (format) {
@@ -74,121 +92,19 @@ tabularRouter.get("/", requireAuth, async (req, res) => {
     const userEmail = res.locals.userEmail as string | undefined;
     const db = createServerSupabase();
 
-    // Optional ?project_id= scopes results to a single project. Project-page
-    // callers pass it; the global tabular-reviews page omits it. We still
-    // enforce access via listAccessibleProjectIds so a stranger can't request
-    // an arbitrary project_id.
     const projectIdFilter =
         typeof req.query.project_id === "string" && req.query.project_id
             ? (req.query.project_id as string)
             : null;
 
-    // Visible reviews = user's own + reviews in any accessible project.
-    const projectIds = await listAccessibleProjectIds(userId, userEmail, db);
+    const { data, error } = await db.rpc("get_tabular_reviews_overview", {
+        p_user_id: userId,
+        p_user_email: userEmail ?? null,
+        p_project_id: projectIdFilter,
+    });
+    if (error) return void res.status(500).json({ detail: error.message });
 
-    if (projectIdFilter && !projectIds.includes(projectIdFilter)) {
-        // No access to that project — also covers "project doesn't exist".
-        return void res.json([]);
-    }
-
-    let ownQuery = db
-        .from("tabular_reviews")
-        .select("*")
-        .eq("user_id", userId)
-        .order("created_at", { ascending: false });
-    if (projectIdFilter) ownQuery = ownQuery.eq("project_id", projectIdFilter);
-
-    const sharedProjectIds = projectIdFilter ? [projectIdFilter] : projectIds;
-    // Three sources to merge:
-    //  - own:           reviews this user created
-    //  - sharedProj:    reviews in a project the user has access to
-    //  - sharedDirect:  standalone reviews (project_id null) where the
-    //                   user's email is in tabular_reviews.shared_with
-    const [
-        { data: own, error: ownErr },
-        { data: shared, error: sharedErr },
-        { data: sharedDirect, error: sharedDirectErr },
-    ] = await Promise.all([
-        ownQuery,
-        sharedProjectIds.length > 0
-            ? db
-                  .from("tabular_reviews")
-                  .select("*")
-                  .in("project_id", sharedProjectIds)
-                  .neq("user_id", userId)
-                  .order("created_at", { ascending: false })
-            : Promise.resolve({
-                  data: [] as Record<string, unknown>[],
-                  error: null,
-              }),
-        // Skip the direct-share lookup when the caller is filtering to a
-        // specific project — direct shares are inherently project-id-null.
-        userEmail && !projectIdFilter
-            ? db
-                  .from("tabular_reviews")
-                  .select("*")
-                  .filter("shared_with", "cs", JSON.stringify([userEmail]))
-                  .neq("user_id", userId)
-                  .order("created_at", { ascending: false })
-            : Promise.resolve({
-                  data: [] as Record<string, unknown>[],
-                  error: null,
-              }),
-    ]);
-    if (ownErr) return void res.status(500).json({ detail: ownErr.message });
-    // Don't fail the whole list when an auxiliary share query errors — most
-    // commonly the tabular_reviews.shared_with column hasn't been migrated
-    // yet. Log and continue so the user still sees their own reviews.
-    if (sharedErr)
-        console.warn(
-            "[tabular] shared-by-project query failed:",
-            sharedErr.message,
-        );
-    if (sharedDirectErr)
-        console.warn(
-            "[tabular] shared-by-email query failed:",
-            sharedDirectErr.message,
-        );
-    const seen = new Set<string>();
-    const reviews: Record<string, unknown>[] = [];
-    for (const r of [
-        ...(own ?? []),
-        ...(shared ?? []),
-        ...(sharedDirect ?? []),
-    ]) {
-        const id = (r as { id: string }).id;
-        if (seen.has(id)) continue;
-        seen.add(id);
-        reviews.push(r as Record<string, unknown>);
-    }
-
-    // Fetch distinct document counts per review
-    const reviewIds = reviews.map((r) => (r as { id: string }).id);
-    let docCounts: Record<string, number> = {};
-    if (reviewIds.length > 0) {
-        const { data: cells } = await db
-            .from("tabular_cells")
-            .select("review_id, document_id")
-            .in("review_id", reviewIds);
-        if (cells) {
-            const seen = new Set<string>();
-            for (const cell of cells) {
-                const key = `${cell.review_id}:${cell.document_id}`;
-                if (!seen.has(key)) {
-                    seen.add(key);
-                    docCounts[cell.review_id] =
-                        (docCounts[cell.review_id] ?? 0) + 1;
-                }
-            }
-        }
-    }
-
-    res.json(
-        reviews.map((r) => {
-            const id = (r as { id: string }).id;
-            return { ...r, document_count: docCounts[id] ?? 0 };
-        }),
-    );
+    res.json(data ?? []);
 });
 
 // POST /tabular-review
@@ -229,6 +145,7 @@ tabularRouter.post("/", requireAuth, async (req, res) => {
             user_id: userId,
             title: title ?? null,
             columns_config,
+            document_ids: allowedDocumentIds,
             project_id: project_id ?? null,
             workflow_id: workflow_id ?? null,
         })
@@ -345,17 +262,24 @@ tabularRouter.get("/:reviewId", requireAuth, async (req, res) => {
         .from("tabular_cells")
         .select("*")
         .eq("review_id", reviewId);
-    const docIds = [...new Set((cells ?? []).map((c) => c.document_id))];
+    const cellDocIds = [...new Set((cells ?? []).map((c) => c.document_id))];
+    const hasExplicitDocIds = Array.isArray(review.document_ids);
+    const explicitDocIds = hasExplicitDocIds
+        ? (review.document_ids as string[])
+        : [];
+    const docIds =
+        hasExplicitDocIds
+            ? explicitDocIds
+            : cellDocIds;
     const docsResult =
         docIds.length > 0
             ? await db.from("documents").select("*").in("id", docIds)
-            : review.project_id
-              ? await db
-                    .from("documents")
-                    .select("*")
-                    .eq("project_id", review.project_id)
-                    .order("created_at", { ascending: true })
-              : { data: [] as Record<string, unknown>[] };
+            : { data: [] as Record<string, unknown>[] };
+    const docs = (docsResult.data ?? []) as unknown as {
+        id: string;
+        current_version_id?: string | null;
+    }[];
+    await attachActiveVersionPaths(db, docs);
 
     res.json({
         review: { ...review, is_owner: access.isOwner },
@@ -363,7 +287,7 @@ tabularRouter.get("/:reviewId", requireAuth, async (req, res) => {
             ...cell,
             content: parseCellContent(cell.content),
         })),
-        documents: docsResult.data ?? [],
+        documents: docs,
     });
 });
 
@@ -394,55 +318,19 @@ tabularRouter.get("/:reviewId/people", requireAuth, async (req, res) => {
             : []
     ).map((e) => (e ?? "").toLowerCase());
 
-    // Same pattern as /projects/:id/people: walk auth.users to map emails
-    // to user_ids, then pull display_names from user_profiles by user_id.
-    const { data: usersData } = await db.auth.admin.listUsers({
-        perPage: 1000,
-    });
-    const allUsers = usersData?.users ?? [];
-    const userByEmail = new Map<string, { id: string; email: string }>();
-    const userById = new Map<string, { id: string; email: string }>();
-    for (const u of allUsers) {
-        if (!u.email) continue;
-        const lower = u.email.toLowerCase();
-        userByEmail.set(lower, { id: u.id, email: u.email });
-        userById.set(u.id, { id: u.id, email: u.email });
-    }
-
-    const memberUserIds: string[] = [];
-    for (const email of sharedWith) {
-        const u = userByEmail.get(email);
-        if (u) memberUserIds.push(u.id);
-    }
-
-    const profileIds = [review.user_id as string, ...memberUserIds].filter(
-        (x, i, arr) => arr.indexOf(x) === i,
-    );
-
-    const profileByUserId = new Map<string, string | null>();
-    if (profileIds.length > 0) {
-        const { data: profiles } = await db
-            .from("user_profiles")
-            .select("user_id, display_name")
-            .in("user_id", profileIds);
-        for (const p of profiles ?? []) {
-            profileByUserId.set(
-                p.user_id as string,
-                (p.display_name as string | null) ?? null,
-            );
-        }
-    }
+    // Use the mirrored profile email so sharing checks do not scan auth.users.
+    const { userByEmail, userById } = await loadProfileUsersByEmail(db);
 
     const ownerInfo = userById.get(review.user_id as string);
     res.json({
         owner: {
             user_id: review.user_id,
             email: ownerInfo?.email ?? null,
-            display_name: profileByUserId.get(review.user_id as string) ?? null,
+            display_name: ownerInfo?.display_name ?? null,
         },
         members: sharedWith.map((email) => {
             const u = userByEmail.get(email);
-            const display_name = u ? (profileByUserId.get(u.id) ?? null) : null;
+            const display_name = u?.display_name ?? null;
             return { email, display_name };
         }),
     });
@@ -455,10 +343,19 @@ tabularRouter.patch("/:reviewId", requireAuth, async (req, res) => {
     const { reviewId } = req.params;
     const updates: Record<string, unknown> = {};
     if (req.body.title != null) updates.title = req.body.title;
-    if (req.body.columns_config != null)
-        updates.columns_config = req.body.columns_config;
-    if (req.body.project_id !== undefined)
-        updates.project_id = req.body.project_id;
+    const projectIdUpdateProvided = req.body.project_id !== undefined;
+    const projectIdUpdate =
+        req.body.project_id === null
+            ? null
+            : typeof req.body.project_id === "string" &&
+                req.body.project_id.trim()
+              ? req.body.project_id.trim()
+              : undefined;
+    if (projectIdUpdateProvided && projectIdUpdate === undefined) {
+        return void res.status(400).json({
+            detail: "project_id must be a non-empty string or null",
+        });
+    }
     // shared_with edits are owner-only — gated below after we know who's
     // making the call. Normalize lowercase + dedupe + drop empties.
     let sharedWithUpdate: string[] | undefined;
@@ -498,12 +395,50 @@ tabularRouter.patch("/:reviewId", requireAuth, async (req, res) => {
     );
     if (!access.ok)
         return void res.status(404).json({ detail: "Review not found" });
+    if (req.body.columns_config != null) {
+        if (!access.isOwner) {
+            return void res.status(403).json({
+                detail: "Only the review owner can change columns",
+            });
+        }
+        updates.columns_config = req.body.columns_config;
+    }
     if (sharedWithUpdate !== undefined) {
         if (!access.isOwner)
             return void res
                 .status(403)
                 .json({ detail: "Only the review owner can change sharing" });
+        const missingSharedUsers = await findMissingUserEmails(
+            db,
+            sharedWithUpdate,
+        );
+        if (missingSharedUsers.length > 0) {
+            return void res.status(400).json({
+                detail: `${missingSharedUsers[0]} does not belong to a Mike user.`,
+            });
+        }
         updates.shared_with = sharedWithUpdate;
+    }
+    if (projectIdUpdateProvided) {
+        if (!access.isOwner) {
+            return void res.status(403).json({
+                detail: "Only the review owner can move a review",
+            });
+        }
+        if (projectIdUpdate) {
+            const projectAccess = await checkProjectAccess(
+                projectIdUpdate,
+                userId,
+                userEmail,
+                db,
+            );
+            if (!projectAccess.ok) {
+                return void res
+                    .status(404)
+                    .json({ detail: "Target project not found" });
+            }
+        }
+        updates.project_id = projectIdUpdate;
     }
 
     const { data: updatedReview, error: updateError } = await db
@@ -517,6 +452,7 @@ tabularRouter.patch("/:reviewId", requireAuth, async (req, res) => {
             detail: updateError?.message ?? "Failed to update review",
         });
 
+    let persistedDocumentIds: string[] | undefined;
     if (
         Array.isArray(req.body.columns_config) ||
         Array.isArray(req.body.document_ids)
@@ -577,13 +513,21 @@ tabularRouter.patch("/:reviewId", requireAuth, async (req, res) => {
                     (existingCells ?? []).map((cell) => cell.document_id),
                 ),
             ];
-            if (documentIds.length === 0 && existingReview.project_id) {
-                const { data: projectDocs } = await db
-                    .from("documents")
-                    .select("id")
-                    .eq("project_id", existingReview.project_id);
-                documentIds = (projectDocs ?? []).map((doc) => doc.id);
-            }
+        }
+
+        if (Array.isArray(req.body.document_ids)) {
+            persistedDocumentIds = documentIds;
+            const { error: documentIdsError } = await db
+                .from("tabular_reviews")
+                .update({
+                    document_ids: documentIds,
+                    updated_at: new Date().toISOString(),
+                })
+                .eq("id", reviewId);
+            if (documentIdsError)
+                return void res.status(500).json({
+                    detail: documentIdsError.message,
+                });
         }
 
         const activeColumns = Array.isArray(req.body.columns_config)
@@ -614,7 +558,10 @@ tabularRouter.patch("/:reviewId", requireAuth, async (req, res) => {
         }
     }
 
-    res.json(updatedReview);
+    res.json({
+        ...updatedReview,
+        ...(persistedDocumentIds ? { document_ids: persistedDocumentIds } : {}),
+    });
 });
 
 // DELETE /tabular-review/:reviewId
@@ -718,7 +665,7 @@ tabularRouter.post(
             return void res.status(404).json({ detail: "Document not found" });
         const { data: doc } = await db
             .from("documents")
-            .select("id, filename, file_type")
+            .select("id, current_version_id")
             .eq("id", document_id)
             .single();
         if (!doc)
@@ -749,10 +696,10 @@ tabularRouter.post(
             const buf = await downloadFile(docActive.storage_path);
             if (buf) {
                 try {
-                    markdown =
-                        (doc.file_type as string) === "pdf"
-                            ? await extractPdfMarkdown(buf)
-                            : await extractDocxMarkdown(buf);
+                    markdown = await extractDocumentMarkdown(
+                        buf,
+                        docActive.file_type,
+                    );
                 } catch (err) {
                     console.error(
                         `[regenerate-cell] extraction error doc=${document_id}`,
@@ -764,7 +711,7 @@ tabularRouter.post(
 
         const result = await queryTabularCell(
             tabular_model,
-            doc.filename as string,
+            docActive?.filename?.trim() || "Untitled document",
             markdown,
             column.prompt,
             column.format,
@@ -840,18 +787,25 @@ tabularRouter.post("/:reviewId/generate", requireAuth, async (req, res) => {
             filteredIds.length > 0
                 ? await db
                       .from("documents")
-                      .select("id, filename, file_type, page_count")
+                      .select("id, current_version_id")
                       .in("id", filteredIds)
                 : { data: [] as Record<string, unknown>[] };
         docs = data ?? [];
     } else if (review.project_id) {
         const { data } = await db
             .from("documents")
-            .select("id, filename, file_type, page_count")
+            .select("id, current_version_id")
             .eq("project_id", review.project_id)
             .order("created_at", { ascending: true });
         docs = data ?? [];
     }
+    await attachActiveVersionPaths(
+        db,
+        docs as {
+            id: string;
+            current_version_id?: string | null;
+        }[],
+    );
 
     const { tabular_model, api_keys } = await getUserModelSettings(userId, db);
     const missingKey = missingModelApiKey(tabular_model, api_keys);
@@ -874,18 +828,24 @@ tabularRouter.post("/:reviewId/generate", requireAuth, async (req, res) => {
         await Promise.all(
             docs.map(async (doc) => {
                 const docId = doc.id as string;
-                const filename = doc.filename as string;
                 let markdown = "";
 
-                const active = await loadActiveVersion(docId, db);
-                if (active) {
-                    const buf = await downloadFile(active.storage_path);
+                const filename =
+                    (typeof doc.filename === "string" && doc.filename.trim()
+                        ? doc.filename.trim()
+                        : "Untitled document");
+                const storagePath =
+                    typeof doc.storage_path === "string" ? doc.storage_path : "";
+                const fileType =
+                    typeof doc.file_type === "string" ? doc.file_type : "";
+                if (storagePath) {
+                    const buf = await downloadFile(storagePath);
                     if (buf) {
                         try {
-                            markdown =
-                                (doc.file_type as string) === "pdf"
-                                    ? await extractPdfMarkdown(buf)
-                                    : await extractDocxMarkdown(buf);
+                            markdown = await extractDocumentMarkdown(
+                                buf,
+                                fileType,
+                            );
                         } catch (err) {
                             console.error(
                                 `[tabular/generate] extraction error doc=${docId}`,
@@ -951,7 +911,7 @@ tabularRouter.post("/:reviewId/generate", requireAuth, async (req, res) => {
                 } catch (err) {
                     console.error(
                         `[tabular/generate] queryTabularAllColumns error doc=${docId}`,
-                        err,
+                        safeErrorLog(err),
                     );
                 }
 
@@ -974,10 +934,10 @@ tabularRouter.post("/:reviewId/generate", requireAuth, async (req, res) => {
 
         write("data: [DONE]\n\n");
     } catch (err) {
-        console.error("[tabular/generate] stream error", err);
+        console.error("[tabular/generate] stream error", safeErrorLog(err));
         try {
             write(
-                `data: ${JSON.stringify({ type: "error", message: String(err) })}\n\ndata: [DONE]\n\n`,
+                `data: ${JSON.stringify({ type: "error", message: safeErrorMessage(err, "Stream error") })}\n\ndata: [DONE]\n\n`,
             );
         } catch {
             /* ignore */
@@ -1227,14 +1187,29 @@ tabularRouter.post("/:reviewId/chat", requireAuth, async (req, res) => {
     const docIds = [
         ...new Set((cells ?? []).map((c: any) => c.document_id as string)),
     ];
-    let docs: { id: string; filename: string }[] = [];
+    let docs: {
+        id: string;
+        filename: string;
+        current_version_id?: string | null;
+    }[] = [];
     if (docIds.length > 0) {
         const { data } = await db
             .from("documents")
-            .select("id, filename")
+            .select("id, current_version_id")
             .in("id", docIds)
             .order("created_at", { ascending: true });
-        docs = (data ?? []) as { id: string; filename: string }[];
+        const attachedDocs = (data ?? []) as {
+            id: string;
+            current_version_id?: string | null;
+            filename?: string | null;
+        }[];
+        await attachActiveVersionPaths(db, attachedDocs);
+        docs = attachedDocs.map((doc) => ({
+            ...doc,
+            filename:
+                (typeof doc.filename === "string" && doc.filename.trim()) ||
+                "Untitled document",
+        }));
     }
 
     const sortedColumns = (
@@ -1268,8 +1243,9 @@ tabularRouter.post("/:reviewId/chat", requireAuth, async (req, res) => {
         messages.filter((m) => m.role === "user").length === 1;
 
     if (chatId) {
-        // Either chat owner OR any project member of the parent review can
-        // continue the chat. We've already verified review access above.
+        // The chat must belong to this exact review and to the requester.
+        // Review access alone is not enough: otherwise a user could reuse one
+        // of their chats from a different review in this route.
         const { data: existing } = await db
             .from("tabular_review_chats")
             .select("id, title, review_id, user_id")
@@ -1277,7 +1253,8 @@ tabularRouter.post("/:reviewId/chat", requireAuth, async (req, res) => {
             .single();
         const canUse =
             !!existing &&
-            (existing.review_id === reviewId || existing.user_id === userId);
+            existing.review_id === reviewId &&
+            existing.user_id === userId;
         if (!canUse || !existing) chatId = null;
         else chatTitle = existing.title;
     }
@@ -1313,6 +1290,11 @@ tabularRouter.post("/:reviewId/chat", requireAuth, async (req, res) => {
     res.setHeader("X-Accel-Buffering", "no");
     res.flushHeaders();
     const write = (line: string) => res.write(line);
+    const streamAbort = new AbortController();
+    let streamFinished = false;
+    res.on("close", () => {
+        if (!streamFinished) streamAbort.abort();
+    });
 
     if (chatId) {
         write(`data: ${JSON.stringify({ type: "chat_id", chatId })}\n\n`);
@@ -1327,20 +1309,23 @@ tabularRouter.post("/:reviewId/chat", requireAuth, async (req, res) => {
             db,
             write,
             extraTools: TABULAR_TOOLS,
+            includeResearchTools: false,
             tabularStore,
             buildCitations: (text) =>
                 extractTabularAnnotations(text, tabularStore),
             model: tabular_model,
             apiKeys: api_keys,
+            signal: streamAbort.signal,
         });
 
+        const persistedEvents = stripTransientAssistantEvents(events);
         const annotations = extractTabularAnnotations(fullText, tabularStore);
 
         if (chatId) {
             await db.from("tabular_review_chat_messages").insert({
                 chat_id: chatId,
                 role: "assistant",
-                content: events.length ? events : null,
+                content: persistedEvents.length ? persistedEvents : null,
                 annotations: annotations.length ? annotations : null,
             });
             await db
@@ -1372,16 +1357,76 @@ tabularRouter.post("/:reviewId/chat", requireAuth, async (req, res) => {
             }
         }
     } catch (err) {
-        console.error("[tabular/chat] error", err);
+        if (isAbortError(err)) {
+            console.log("[tabular/chat] client aborted stream", { chatId });
+            if (chatId && err instanceof AssistantStreamError) {
+                const partial = buildCancelledAssistantMessage({
+                    fullText: err.fullText,
+                    events: err.events,
+                    buildCitations: (fullText) =>
+                        extractTabularAnnotations(fullText, tabularStore),
+                });
+                const annotations = partial.citations;
+                const { error: saveError } = await db
+                    .from("tabular_review_chat_messages")
+                    .insert({
+                        chat_id: chatId,
+                        role: "assistant",
+                        content: partial.events.length ? partial.events : null,
+                        annotations: annotations.length
+                            ? annotations
+                            : null,
+                    });
+                if (saveError) {
+                    console.error(
+                        "[tabular/chat] failed to save aborted stream",
+                        saveError,
+                    );
+                }
+                await db
+                    .from("tabular_review_chats")
+                    .update({ updated_at: new Date().toISOString() })
+                    .eq("id", chatId);
+            }
+            return;
+        }
+        console.error("[tabular/chat] error", safeErrorLog(err));
+        const message = safeErrorMessage(err, "Stream error");
+        const errorEvents = err instanceof AssistantStreamError
+            ? stripTransientAssistantEvents(err.events)
+            : [{ type: "error" as const, message }];
+        const errorFullText =
+            err instanceof AssistantStreamError ? err.fullText : "";
+        if (chatId) {
+            try {
+                const annotations = extractTabularAnnotations(
+                    errorFullText,
+                    tabularStore,
+                );
+                const { error: saveError } = await db
+                    .from("tabular_review_chat_messages")
+                    .insert({
+                        chat_id: chatId,
+                        role: "assistant",
+                        content: errorEvents.length ? errorEvents : null,
+                        annotations: annotations.length ? annotations : null,
+                    });
+                if (saveError)
+                    console.error("[tabular/chat] failed to save error", saveError);
+            } catch (saveErr) {
+                console.error("[tabular/chat] failed to save error", saveErr);
+            }
+        }
         try {
             write(
-                `data: ${JSON.stringify({ type: "error", message: String(err) })}\n\n`,
+                `data: ${JSON.stringify({ type: "error", message })}\n\n`,
             );
             write("data: [DONE]\n\n");
         } catch {
             /* ignore */
         }
     } finally {
+        streamFinished = true;
         res.end();
     }
 });
@@ -1459,7 +1504,7 @@ The "summary" field must contain only the extracted value with inline citations 
             apiKeys,
         });
     } catch (err) {
-        console.error("[queryTabularCell] completion failed", err);
+        console.error("[queryTabularCell] completion failed", safeErrorLog(err));
         return null;
     }
     try {
@@ -1670,11 +1715,39 @@ Rules:
             },
         });
     } catch (err) {
-        console.error("[queryTabularAllColumns] stream failed", err);
+        console.error("[queryTabularAllColumns] stream failed", safeErrorLog(err));
     }
 
     if (contentBuffer.trim()) pending.push(processLine(contentBuffer));
     await Promise.all(pending);
+}
+
+async function extractDocumentMarkdown(
+    buf: ArrayBuffer,
+    fileType: string | null | undefined,
+): Promise<string> {
+    const normalizedType = (fileType ?? "").toLowerCase();
+    if (normalizedType === "pdf") return extractPdfMarkdown(buf);
+    if (normalizedType === "docx") return extractDocxMarkdown(buf);
+    if (isSpreadsheetDocumentType(normalizedType)) {
+        // SheetJS handles .xlsx/.xlsm/.xls directly, no PDF detour.
+        return spreadsheetToLLMText(Buffer.from(buf));
+    }
+    if (normalizedType === "pptx") {
+        return extractPresentationText(Buffer.from(buf));
+    }
+    if (
+        isPresentationDocumentType(normalizedType) ||
+        isWordDocumentType(normalizedType)
+    ) {
+        const pdfBuf = await docxToPdf(Buffer.from(buf));
+        const pdfArrayBuffer = pdfBuf.buffer.slice(
+            pdfBuf.byteOffset,
+            pdfBuf.byteOffset + pdfBuf.byteLength,
+        ) as ArrayBuffer;
+        return extractPdfMarkdown(pdfArrayBuffer);
+    }
+    return extractDocxMarkdown(buf);
 }
 
 async function extractPdfMarkdown(buf: ArrayBuffer): Promise<string> {

@@ -2,13 +2,13 @@
 
 import { useEffect, useState } from "react";
 import { getProject, listProjects, listStandaloneDocuments } from "@/app/lib/mikeApi";
-import type { MikeDocument, MikeProject } from "./types";
+import type { Document, Project } from "./types";
 
 const CACHE_TTL_MS = 30_000;
 
 interface DirectoryCache {
-    standaloneDocuments: MikeDocument[];
-    projects: MikeProject[];
+    standaloneDocuments: Document[];
+    projects: Project[];
     fetchedAt: number;
 }
 
@@ -20,8 +20,8 @@ export function invalidateDirectoryCache() {
 
 export function useDirectoryData(enabled: boolean) {
     const [loading, setLoading] = useState(true);
-    const [standaloneDocuments, setStandaloneDocuments] = useState<MikeDocument[]>([]);
-    const [projects, setProjects] = useState<MikeProject[]>([]);
+    const [standaloneDocuments, setStandaloneDocuments] = useState<Document[]>([]);
+    const [projects, setProjects] = useState<Project[]>([]);
 
     useEffect(() => {
         if (!enabled) return;
@@ -42,13 +42,23 @@ export function useDirectoryData(enabled: boolean) {
                 );
                 return Promise.all(ps.map((p) => getProject(p.id))).then(
                     (fullProjects) => {
+                        const projectCounts = new Map(
+                            ps.map((p) => [p.id, p.document_count ?? 0]),
+                        );
+                        const projectsWithCounts = fullProjects.map((project) => ({
+                            ...project,
+                            document_count:
+                                project.documents?.length ??
+                                projectCounts.get(project.id) ??
+                                0,
+                        }));
                         cache = {
                             standaloneDocuments: sorted,
-                            projects: fullProjects,
+                            projects: projectsWithCounts,
                             fetchedAt: Date.now(),
                         };
                         setStandaloneDocuments(sorted);
-                        setProjects(fullProjects);
+                        setProjects(projectsWithCounts);
                     },
                 );
             })
