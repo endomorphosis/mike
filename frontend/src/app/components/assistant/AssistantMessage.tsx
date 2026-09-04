@@ -2,7 +2,12 @@
 
 import { useRef, useState } from "react";
 import { Check, Copy } from "lucide-react";
-import type { AssistantEvent, Citation, EditAnnotation } from "../shared/types";
+import type {
+    AssistantEvent,
+    Citation,
+    EditAnnotation,
+    PanelDocument,
+} from "../shared/types";
 import { EditCard } from "./EditCard";
 import { PreResponseWrapper } from "./PreResponseWrapper";
 import { ResponseStatus, type StatusState } from "./message/ResponseStatus";
@@ -17,7 +22,7 @@ import {
     CourtListenerBlock,
     DocCreatedBlock,
     DocDownloadBlock,
-    DocEditedBlock,
+    DocEditBlock,
     DocFindBlock,
     DocReadBlock,
     DocReplicatedBlock,
@@ -35,6 +40,7 @@ interface Props {
     errorMessage?: string;
     citations?: Citation[];
     citationStatus?: "started" | "partial" | "final";
+    activeCitation?: Citation | null;
     onCitationClick?: (citation: Citation) => void;
     onOpenCitationSource?: (citation: Citation) => void;
     onCaseClick?: (
@@ -105,6 +111,7 @@ export function AssistantMessage({
     errorMessage,
     citations = [],
     citationStatus,
+    activeCitation,
     onCitationClick,
     onOpenCitationSource,
     onCaseClick,
@@ -211,10 +218,7 @@ export function AssistantMessage({
         string,
         Extract<AssistantEvent, { type: "case_citation" }>
     >();
-    const caseOpinions = new Map<
-        number,
-        Extract<AssistantEvent, { type: "case_opinions" }>["case"]
-    >();
+    const caseDocuments = new Map<number, PanelDocument>();
     const processedTexts: string[] = [];
     if (events) {
         for (let i = 0; i < events.length; i++) {
@@ -223,7 +227,9 @@ export function AssistantMessage({
                 const hrefKey = internalCaseHref(event.cluster_id);
                 if (hrefKey) caseCitations.set(hrefKey, event);
             } else if (event.type === "case_opinions") {
-                caseOpinions.set(event.cluster_id, event.case);
+                if (event.document) {
+                    caseDocuments.set(event.cluster_id, event.document);
+                }
             }
             processedTexts.push(
                 event.type === "content"
@@ -422,9 +428,20 @@ export function AssistantMessage({
                     filename={event.filename}
                     isStreaming={event.isStreaming}
                     onClick={
-                        !event.isStreaming && ann && onCitationClick
-                            ? () => onCitationClick(ann)
-                            : undefined
+                        !event.isStreaming &&
+                        event.document_id &&
+                        onOpenDocument
+                            ? () =>
+                                  onOpenDocument({
+                                      documentId: event.document_id!,
+                                      filename: event.filename,
+                                      versionId: event.version_id ?? null,
+                                      versionNumber:
+                                          event.version_number ?? null,
+                                  })
+                            : !event.isStreaming && ann && onCitationClick
+                              ? () => onCitationClick(ann)
+                              : undefined
                     }
                     showConnector={showConnector}
                 />
@@ -439,6 +456,20 @@ export function AssistantMessage({
                     totalMatches={event.total_matches}
                     isStreaming={!!event.isStreaming}
                     showConnector={showConnector}
+                    onClick={
+                        !event.isStreaming &&
+                        event.document_id &&
+                        onOpenDocument
+                            ? () =>
+                                  onOpenDocument({
+                                      documentId: event.document_id!,
+                                      filename: event.filename,
+                                      versionId: event.version_id ?? null,
+                                      versionNumber:
+                                          event.version_number ?? null,
+                                  })
+                            : undefined
+                    }
                 />
             );
         }
@@ -449,6 +480,20 @@ export function AssistantMessage({
                     filename={event.filename}
                     isStreaming={event.isStreaming}
                     showConnector={showConnector}
+                    onClick={
+                        !event.isStreaming &&
+                        event.document_id &&
+                        onOpenDocument
+                            ? () =>
+                                  onOpenDocument({
+                                      documentId: event.document_id!,
+                                      filename: event.filename,
+                                      versionId: event.version_id ?? null,
+                                      versionNumber:
+                                          event.version_number ?? null,
+                                  })
+                            : undefined
+                    }
                 />
             );
         }
@@ -461,20 +506,46 @@ export function AssistantMessage({
                     key={globalIdx}
                     filename={event.filename}
                     count={event.count}
+                    copies={event.copies}
                     isStreaming={!!event.isStreaming}
                     hasError={!!event.error}
                     showConnector={showConnector}
+                    onOpenCopy={
+                        !event.isStreaming && onOpenDocument
+                            ? (copy) =>
+                                  onOpenDocument({
+                                      documentId: copy.document_id,
+                                      filename: copy.new_filename,
+                                      versionId: copy.version_id,
+                                      versionNumber: 1,
+                                  })
+                            : undefined
+                    }
                 />
             );
         }
         if (event.type === "doc_edited") {
             return (
-                <DocEditedBlock
+                <DocEditBlock
                     key={globalIdx}
                     filename={event.filename}
                     isStreaming={event.isStreaming}
                     hasError={!!event.error}
                     showConnector={showConnector}
+                    onClick={
+                        !event.isStreaming &&
+                        event.document_id &&
+                        onOpenDocument
+                            ? () =>
+                                  onOpenDocument({
+                                      documentId: event.document_id,
+                                      filename: event.filename,
+                                      versionId: event.version_id || null,
+                                      versionNumber:
+                                          event.version_number ?? null,
+                                  })
+                            : undefined
+                    }
                 />
             );
         }
@@ -496,7 +567,7 @@ export function AssistantMessage({
             const response = askInputsResponseFor(globalIdx);
             return (
                 <AskInputsBlock
-                    key={globalIdx}
+                    key={`${globalIdx}-${response ? "complete" : "pending"}`}
                     event={event}
                     response={response}
                     showConnector={showConnector}
@@ -744,7 +815,8 @@ export function AssistantMessage({
                                                 inlineCitationTargets
                                             }
                                             caseCitations={caseCitations}
-                                            caseOpinions={caseOpinions}
+                                            caseDocuments={caseDocuments}
+                                            activeCitation={activeCitation}
                                             onCitationClick={onCitationClick}
                                             onCaseClick={onCaseClick}
                                             divRef={
@@ -882,7 +954,22 @@ export function AssistantMessage({
                                         filenameByDocId={filenameByDocId}
                                         cards={cards}
                                         resolvedCount={resolvedCount}
-                                        onViewClick={onEditViewClick}
+                                        onViewClick={
+                                            onOpenDocument
+                                                ? (annotation, filename) =>
+                                                      onOpenDocument({
+                                                          documentId:
+                                                              annotation.document_id,
+                                                          filename,
+                                                          versionId:
+                                                              annotation.version_id ??
+                                                              null,
+                                                          versionNumber:
+                                                              annotation.version_number ??
+                                                              null,
+                                                      })
+                                                : undefined
+                                        }
                                         onResolveStart={onEditResolveStart}
                                         onResolved={handleEditResolved}
                                         onError={onEditError}
@@ -1012,6 +1099,7 @@ export function AssistantMessage({
                 {showCitationBlock && (
                     <CitationsBlock
                         citations={citations}
+                        activeCitation={activeCitation}
                         onCitationClick={onCitationClick}
                         onOpenSource={handleOpenCitationSource}
                         canOpenSource={canOpenCitationSource}
@@ -1027,13 +1115,17 @@ export function AssistantMessage({
                 <div className="flex items-center gap-2 py-2 font-sans justify-start">
                     {!isStreaming && (
                         <button
+                            type="button"
+                            aria-label={
+                                isCopied ? "Response copied" : "Copy response"
+                            }
                             className="p-1.5 rounded text-gray-500 hover:text-gray-700 hover:bg-gray-100"
                             onClick={handleCopy}
                         >
                             {isCopied ? (
-                                <Check className="h-3.5 w-3.5 text-green-600" />
+                                <Check className="h-3 w-3 text-green-600" />
                             ) : (
-                                <Copy className="h-3.5 w-3.5" />
+                                <Copy className="h-3 w-3" />
                             )}
                         </button>
                     )}

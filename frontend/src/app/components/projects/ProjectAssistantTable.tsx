@@ -1,26 +1,39 @@
 "use client";
 
-import { type Dispatch, type SetStateAction } from "react";
-import { MessageSquare } from "lucide-react";
+import {
+    useMemo,
+    useRef,
+    useState,
+    type Dispatch,
+    type SetStateAction,
+} from "react";
 import {
     RowActionMenuItems,
     RowActions,
 } from "@/app/components/shared/RowActions";
 import {
     TABLE_CHECKBOX_CLASS,
-    TABLE_STICKY_CELL_BG,
-    SkeletonDot,
+    SkeletonCheckbox,
     SkeletonLine,
     TableBody,
     TableCell,
     TableEmptyState,
+    TableFilters,
+    type TableFilterOption,
     TableHeaderCell,
     TableHeaderRow,
     TablePrimaryCell,
     TableRow,
     TableScrollArea,
+    rowActionSelectionIds,
+    selectedIdsAfterRangeClick,
+    selectedIdsAfterShiftClick,
+    type TableSortDirection,
     TableStickyCell,
 } from "@/app/components/shared/TablePrimitive";
+import { EmptyState } from "@/app/components/ui/empty-state";
+import { PillButton } from "@/app/components/ui/pill-button";
+import { ChatSkeuoIcon } from "@/app/components/shared/AppSidebarSkeuoIcons";
 import type { Chat } from "@/app/components/shared/types";
 import { formatDate } from "./ProjectPageParts";
 
@@ -29,18 +42,24 @@ function creatorLabel(chat: Chat, currentUserId?: string | null) {
     return chat.creator_display_name?.trim() || "Shared";
 }
 
+type ProjectChatSortKey = "name" | "created";
+
+const SORT_OPTIONS: TableFilterOption<TableSortDirection>[] = [
+    { value: "asc", label: "Ascending" },
+    { value: "desc", label: "Descending" },
+];
+
 export function ProjectAssistantTable({
     chats,
     filteredChats,
     selectedChatIds,
-    allChatsSelected,
-    someChatsSelected,
     renamingChatId,
     renameChatValue,
     currentUserId,
     onCreateChat,
     onOpenChat,
     onDeleteChat,
+    onDeleteSelectedChats,
     onOwnerOnlyAction,
     submitChatRename,
     setSelectedChatIds,
@@ -59,6 +78,7 @@ export function ProjectAssistantTable({
     onCreateChat: () => void;
     onOpenChat: (chatId: string) => void;
     onDeleteChat: (chat: Chat) => Promise<void> | void;
+    onDeleteSelectedChats: () => Promise<void> | void;
     onOwnerOnlyAction: (action: string) => void;
     submitChatRename: (chatId: string) => Promise<void> | void;
     setSelectedChatIds: Dispatch<SetStateAction<string[]>>;
@@ -66,34 +86,151 @@ export function ProjectAssistantTable({
     setRenameChatValue: Dispatch<SetStateAction<string>>;
     loading?: boolean;
 }) {
+    const [creatorFilter, setCreatorFilter] = useState<string | null>(null);
+    const [sort, setSort] = useState<{
+        key: ProjectChatSortKey;
+        direction: TableSortDirection;
+    } | null>(null);
+    const rowSelectionAnchorIdRef = useRef<string | null>(null);
+
+    function clearSelection() {
+        rowSelectionAnchorIdRef.current = null;
+        setSelectedChatIds([]);
+    }
+
+    function handleCreatorFilterChange(value: string | null) {
+        setCreatorFilter(value);
+        clearSelection();
+    }
+
+    function handleSortChange(
+        key: ProjectChatSortKey,
+        direction: TableSortDirection | null,
+    ) {
+        setSort(direction ? { key, direction } : null);
+        clearSelection();
+    }
+
+    const creatorOptions = useMemo(
+        () =>
+            Array.from(
+                new Set(chats.map((chat) => creatorLabel(chat, currentUserId))),
+            )
+                .sort((a, b) => a.localeCompare(b))
+                .map((creator) => ({ value: creator, label: creator })),
+        [chats, currentUserId],
+    );
+
+    const visibleChats = useMemo(() => {
+        const rows = filteredChats.filter(
+            (chat) =>
+                !creatorFilter ||
+                creatorLabel(chat, currentUserId) === creatorFilter,
+        );
+        if (!sort) return rows;
+
+        return [...rows].sort((a, b) => {
+            const multiplier = sort.direction === "asc" ? 1 : -1;
+            if (sort.key === "created") {
+                return (
+                    (new Date(a.created_at).getTime() -
+                        new Date(b.created_at).getTime()) *
+                    multiplier
+                );
+            }
+
+            return (
+                (a.title ?? "Untitled Chat").localeCompare(
+                    b.title ?? "Untitled Chat",
+                ) * multiplier
+            );
+        });
+    }, [creatorFilter, currentUserId, filteredChats, sort]);
+
+    const allVisibleChatsSelected =
+        visibleChats.length > 0 &&
+        visibleChats.every((chat) => selectedChatIds.includes(chat.id));
+    const someVisibleChatsSelected =
+        !allVisibleChatsSelected &&
+        visibleChats.some((chat) => selectedChatIds.includes(chat.id));
+    const nameSortDirection = sort?.key === "name" ? sort.direction : null;
+    const createdSortDirection =
+        sort?.key === "created" ? sort.direction : null;
+    const nameFilterButton = (
+        <TableFilters
+            label="Sort by chat name"
+            value={nameSortDirection}
+            allLabel="Default Order"
+            widthClassName="w-40"
+            align="right"
+            options={SORT_OPTIONS}
+            onChange={(direction) => handleSortChange("name", direction)}
+        />
+    );
+    const creatorFilterButton = (
+        <TableFilters
+            label="Filter by creator"
+            value={creatorFilter}
+            allLabel="All Creators"
+            widthClassName="w-44"
+            options={creatorOptions}
+            onChange={handleCreatorFilterChange}
+        />
+    );
+    const createdFilterButton = (
+        <TableFilters
+            label="Sort by created date"
+            value={createdSortDirection}
+            allLabel="Default Order"
+            widthClassName="w-40"
+            options={SORT_OPTIONS}
+            onChange={(direction) => handleSortChange("created", direction)}
+        />
+    );
+
     return (
         <TableScrollArea
             header={
                 <TableHeaderRow className="pr-8 md:pr-8">
                     <TableStickyCell header>
                         {loading ? (
-                            <SkeletonDot />
+                            <SkeletonCheckbox />
                         ) : (
                             <input
                                 type="checkbox"
-                                checked={allChatsSelected}
+                                checked={allVisibleChatsSelected}
                                 ref={(el) => {
-                                    if (el) el.indeterminate = someChatsSelected;
+                                    if (el)
+                                        el.indeterminate =
+                                            someVisibleChatsSelected;
                                 }}
                                 onChange={() => {
-                                    if (allChatsSelected) setSelectedChatIds([]);
+                                    rowSelectionAnchorIdRef.current = null;
+                                    if (allVisibleChatsSelected)
+                                        setSelectedChatIds([]);
                                     else
                                         setSelectedChatIds(
-                                            filteredChats.map((c) => c.id),
+                                            visibleChats.map((c) => c.id),
                                         );
                                 }}
                                 className={TABLE_CHECKBOX_CLASS}
                             />
                         )}
-                        <span>Chats</span>
+                        <span className="mr-1">Chats</span>
+                        {!loading && nameFilterButton}
                     </TableStickyCell>
-                    <TableHeaderCell className="ml-auto w-32">Creator</TableHeaderCell>
-                    <TableHeaderCell className="w-32">Created</TableHeaderCell>
+                    <TableHeaderCell className="ml-auto w-32">
+                        <div className="flex items-center gap-1">
+                            <span>Creator</span>
+                            {!loading && creatorFilterButton}
+                        </div>
+                    </TableHeaderCell>
+                    <TableHeaderCell className="w-32">
+                        <div className="flex items-center gap-1">
+                            <span>Created</span>
+                            {!loading && createdFilterButton}
+                        </div>
+                    </TableHeaderCell>
                     <TableHeaderCell className="w-8" />
                 </TableHeaderRow>
             }
@@ -102,64 +239,116 @@ export function ProjectAssistantTable({
                 <ProjectAssistantLoadingRows />
             ) : chats.length === 0 ? (
                 <TableEmptyState>
-                    <MessageSquare className="h-8 w-8 text-gray-300 mb-4" />
-                    <p className="text-2xl font-medium font-serif text-gray-900">
-                        Assistant
-                    </p>
-                    <p className="mt-1 text-xs text-gray-400 max-w-xs">
-                        Ask questions and get answers grounded in the documents
-                        in this project.
-                    </p>
-                    <button
-                        onClick={onCreateChat}
-                        className="mt-4 inline-flex items-center gap-1 rounded-full bg-gray-900 px-3 py-1 text-xs font-medium text-white hover:bg-gray-700 transition-colors shadow-md"
-                    >
-                        + Create New
-                    </button>
+                    <EmptyState
+                        icon={<ChatSkeuoIcon />}
+                        title="Assistant"
+                        description="Ask questions and get answers grounded in the documents in this project."
+                        action={
+                            <PillButton
+                                tone="black"
+                                size="sm"
+                                onClick={onCreateChat}
+                                className="px-3"
+                            >
+                                Create
+                            </PillButton>
+                        }
+                    />
                 </TableEmptyState>
             ) : (
                 <TableBody>
-                    {filteredChats.map((chat) => (
+                    {visibleChats.map((chat) => {
+                        const actionIds = rowActionSelectionIds(
+                            chat.id,
+                            selectedChatIds,
+                        );
+                        const appliesToSelection = actionIds.length > 1;
+                        return (
                         <TableRow
                             key={chat.id}
-                            rightClickDropdown={(close) => (
+                            selected={selectedChatIds.includes(chat.id)}
+                            rightClickDropdown={(close, menuProps) => (
                                 <RowActionMenuItems
                                     onClose={close}
-                                    onRename={() => {
-                                        if (
-                                            currentUserId &&
-                                            chat.user_id !== currentUserId
-                                        ) {
-                                            onOwnerOnlyAction("rename this chat");
-                                            return;
-                                        }
-                                        setRenameChatValue(
-                                            chat.title ?? "Untitled Chat",
-                                        );
-                                        setRenamingChatId(chat.id);
-                                    }}
-                                    onDelete={() => onDeleteChat(chat)}
+                                    surfaceProps={menuProps}
+                                    onView={
+                                        appliesToSelection
+                                            ? undefined
+                                            : () => onOpenChat(chat.id)
+                                    }
+                                    onRename={
+                                        appliesToSelection
+                                            ? undefined
+                                            : () => {
+                                                  if (
+                                                      currentUserId &&
+                                                      chat.user_id !== currentUserId
+                                                  ) {
+                                                      onOwnerOnlyAction("rename this chat");
+                                                      return;
+                                                  }
+                                                  setRenameChatValue(
+                                                      chat.title ?? "Untitled Chat",
+                                                  );
+                                                  setRenamingChatId(chat.id);
+                                              }
+                                    }
+                                    onDelete={() =>
+                                        appliesToSelection
+                                            ? onDeleteSelectedChats()
+                                            : onDeleteChat(chat)
+                                    }
+                                    deleteLabel={
+                                        appliesToSelection
+                                            ? `Delete ${actionIds.length} chats`
+                                            : undefined
+                                    }
                                 />
                             )}
-                            onClick={() => {
+                            onClick={(event) => {
                                 if (renamingChatId === chat.id) return;
+                                if (event.shiftKey) {
+                                    event.preventDefault();
+                                    const anchorId =
+                                        rowSelectionAnchorIdRef.current;
+                                    setSelectedChatIds((current) =>
+                                        selectedIdsAfterRangeClick(
+                                            chat.id,
+                                            visibleChats.map(
+                                                (visibleChat) => visibleChat.id,
+                                            ),
+                                            current,
+                                            anchorId,
+                                        ),
+                                    );
+                                    rowSelectionAnchorIdRef.current = chat.id;
+                                    return;
+                                }
+                                if (event.ctrlKey || event.metaKey) {
+                                    event.preventDefault();
+                                    setSelectedChatIds((current) =>
+                                        selectedIdsAfterShiftClick(
+                                            chat.id,
+                                            current,
+                                        ),
+                                    );
+                                    rowSelectionAnchorIdRef.current = chat.id;
+                                    return;
+                                }
                                 onOpenChat(chat.id);
                             }}
                             className="pr-8 md:pr-8"
                         >
                             <TablePrimaryCell
-                                bgClassName={
-                                    selectedChatIds.includes(chat.id)
-                                        ? "bg-gray-50"
-                                        : TABLE_STICKY_CELL_BG
-                                }
                                 selected={selectedChatIds.includes(chat.id)}
                                 onSelectionChange={() =>
-                                    setSelectedChatIds((prev) =>
-                                        prev.includes(chat.id)
+                                    setSelectedChatIds((prev) => {
+                                        rowSelectionAnchorIdRef.current =
+                                            chat.id;
+                                        return prev.includes(chat.id)
                                             ? prev.filter((x) => x !== chat.id)
-                                            : [...prev, chat.id],
-                                    )
+                                            : [...prev, chat.id];
+                                    })
                                 }
                                 label={chat.title ?? "Untitled Chat"}
                                 editing={renamingChatId === chat.id}
@@ -181,6 +370,7 @@ export function ProjectAssistantTable({
                                 onClick={(e) => e.stopPropagation()}
                             >
                                 <RowActions
+                                    onView={() => onOpenChat(chat.id)}
                                     onRename={() => {
                                         if (
                                             currentUserId &&
@@ -198,7 +388,8 @@ export function ProjectAssistantTable({
                                 />
                             </div>
                         </TableRow>
-                    ))}
+                        );
+                    })}
                 </TableBody>
             )}
         </TableScrollArea>
@@ -217,8 +408,8 @@ function ProjectAssistantLoadingRows() {
                     className="pr-8 md:pr-8"
                 >
                     <TableStickyCell hover={false}>
-                        <div className="flex min-w-0 items-center gap-4">
-                            <SkeletonDot />
+                        <div className="flex min-w-0 items-center">
+                            <SkeletonCheckbox />
                             <SkeletonLine
                                 className={`h-3.5 ${titleWidths[i - 1]}`}
                             />

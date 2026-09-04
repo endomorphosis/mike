@@ -1,7 +1,8 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { supabase } from "@/app/lib/supabase";
+import { API_BASE } from "@/app/lib/mikeApi";
+import { authenticatedFetch } from "@/app/lib/authEvents";
 
 /**
  * /display returns PDF bytes (when the active version has a PDF rendition),
@@ -26,6 +27,7 @@ function isSpreadsheetContentType(contentType: string): boolean {
 export function useFetchSingleDoc(
     documentId: string | null | undefined,
     versionId?: string | null,
+    displayUrl?: string | null,
 ) {
     const [result, setResult] = useState<DocResult>(null);
     const [loading, setLoading] = useState(false);
@@ -34,7 +36,8 @@ export function useFetchSingleDoc(
 
     useEffect(() => {
         if (!documentId) return;
-        const requestKey = `${documentId}:${versionId ?? "current"}`;
+        const requestKey =
+            displayUrl ?? `${documentId}:${versionId ?? "current"}`;
         if (requestKey === prevKeyRef.current) return;
         prevKeyRef.current = requestKey;
 
@@ -46,31 +49,19 @@ export function useFetchSingleDoc(
 
         (async () => {
             try {
-                const {
-                    data: { session },
-                } = await supabase.auth.getSession();
-                const token = session?.access_token;
                 if (cancelled) return;
-
-                const apiBase =
-                    process.env.NEXT_PUBLIC_API_BASE_URL ??
-                    "http://localhost:3001";
                 const qs = versionId
                     ? `?version_id=${encodeURIComponent(versionId)}`
                     : "";
-                const response = await fetch(
-                    `${apiBase}/single-documents/${documentId}/display${qs}`,
-                    {
-                        headers: token
-                            ? { Authorization: `Bearer ${token}` }
-                            : {},
-                    },
+                const response = await authenticatedFetch(
+                    displayUrl ??
+                        `${API_BASE}/single-documents/${documentId}/display${qs}`,
+                    { credentials: "include" },
                 );
                 if (!response.ok) throw new Error(`HTTP ${response.status}`);
                 if (cancelled) return;
 
-                const contentType =
-                    response.headers.get("content-type") ?? "";
+                const contentType = response.headers.get("content-type") ?? "";
                 if (contentType.includes("application/pdf")) {
                     const buffer = await response.arrayBuffer();
                     if (!cancelled) setResult({ type: "pdf", buffer });
@@ -79,8 +70,8 @@ export function useFetchSingleDoc(
                     if (!cancelled) setResult({ type: "spreadsheet", buffer });
                 } else {
                     // Drain the body so the connection is reusable, but the
-                    // bytes are useless to the PDF viewer — the caller will
-                    // fall back to DocxView, which fetches `/docx` itself.
+                    // bytes are useless to PDF/spreadsheet viewers. Callers
+                    // should route DOC/DOCX files to DocxView directly.
                     await response.arrayBuffer().catch(() => {});
                     if (!cancelled) setResult({ type: "docx" });
                 }
@@ -95,7 +86,7 @@ export function useFetchSingleDoc(
             cancelled = true;
             prevKeyRef.current = null;
         };
-    }, [documentId, versionId]);
+    }, [displayUrl, documentId, versionId]);
 
     return { result, loading, error };
 }

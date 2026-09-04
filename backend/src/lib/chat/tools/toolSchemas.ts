@@ -28,36 +28,6 @@ export const PROJECT_EXTRA_TOOLS = [
       },
     },
   },
-  {
-    type: "function",
-    function: {
-      name: "replicate_document",
-      description:
-        "Make byte-for-byte copies of an existing project document as new project documents. Use when the user wants standalone copies to edit (e.g. 'use this NDA as a template', 'give me three drafts I can adapt') without modifying the original. Pass `count` to create multiple copies in a single call rather than calling the tool repeatedly. Returns the new doc_id slugs so you can immediately call edit_document / read_document on them.",
-      parameters: {
-        type: "object",
-        properties: {
-          doc_id: {
-            type: "string",
-            description: "ID of the source document to copy (e.g. 'doc-0').",
-          },
-          count: {
-            type: "integer",
-            description:
-              "How many copies to create. Defaults to 1. Maximum 20.",
-            minimum: 1,
-            maximum: 20,
-          },
-          new_filename: {
-            type: "string",
-            description:
-              "Optional base filename. With count > 1, copies are suffixed (e.g. 'Foo (1).docx', 'Foo (2).docx'). Extension is forced to match the source.",
-          },
-        },
-        required: ["doc_id"],
-      },
-    },
-  },
 ];
 
 export const TABULAR_TOOLS = [
@@ -122,9 +92,40 @@ export const TOOLS = [
   {
     type: "function",
     function: {
+      name: "replicate_document",
+      description:
+        "Copy an available document, Library Template, or workflow asset without changing the source. In a project chat, copies are saved to Project Documents; otherwise they are saved to Library Files. Always use this before editing or drafting from a Library Template or workflow asset. For an ordinary document, use it only when the user specifically asks for a copy/duplicate or a new document based on that file. Returns new doc_id slugs for read_document and edit_document.",
+      parameters: {
+        type: "object",
+        properties: {
+          doc_id: {
+            type: "string",
+            description:
+              "Chat-local ID of the source document, Library Template, or workflow asset.",
+          },
+          count: {
+            type: "integer",
+            description:
+              "How many copies to create. Defaults to 1. Maximum 20.",
+            minimum: 1,
+            maximum: 20,
+          },
+          new_filename: {
+            type: "string",
+            description:
+              "New base filename. Required for Library Templates and workflow assets. With count > 1, copies are numbered. The extension is forced to match the source.",
+          },
+        },
+        required: ["doc_id"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "ask_inputs",
       description:
-        "Ask the user for one or more decisions, clarifications, or document uploads before continuing. Use this when guessing would materially affect the answer or when required documents have not been attached. Put all needed questions and document requests in one items array. After calling ask_inputs, do not continue the substantive task until the user responds in a later message.",
+        "Ask the user for one or more decisions, open-ended answers, clarifications, or document uploads before continuing. Use a text item when the user should type a free-form answer and there are no useful suggested options. Use this when guessing would materially affect the answer or when required documents have not been attached. Put all needed questions and document requests in one items array. After calling ask_inputs, do not continue the substantive task until the user responds in a later message.",
       parameters: {
         type: "object",
         properties: {
@@ -133,7 +134,7 @@ export const TOOLS = [
             minItems: 1,
             maxItems: 12,
             description:
-              "The list of user inputs needed before continuing. Use choice items for decisions/clarifications and documents items for required uploads.",
+              "The list of user inputs needed before continuing. Use choice items when useful options exist, text items for open-ended answers such as a name or address, and documents items for required uploads.",
             items: {
               type: "object",
               properties: {
@@ -144,12 +145,12 @@ export const TOOLS = [
                 },
                 kind: {
                   type: "string",
-                  enum: ["choice", "documents"],
+                  enum: ["choice", "text", "documents"],
                 },
                 question: {
                   type: "string",
                   description:
-                    "For choice items only: the concise question to show to the user.",
+                    "For choice and text items: the concise question to show to the user.",
                 },
                 options: {
                   type: "array",
@@ -207,13 +208,14 @@ export const TOOLS = [
     function: {
       name: "read_document",
       description:
-        "Read the full text content of a document attached by the user. Always call this before answering questions about, summarising, citing from, or editing a document, but call it at most once per document/version in a single response. After this returns, use the prior tool result or find_in_document for targeted checks instead of reading the same document/version again.",
+        "Read the full text content of an available document. Always call this before answering questions about, summarising, citing from, or editing a document, but call it at most once per document/version in a single response. After this returns, use the prior tool result or find_in_document for targeted checks instead of reading the same document/version again.",
       parameters: {
         type: "object",
         properties: {
           doc_id: {
             type: "string",
-            description: "The document ID to read (e.g. 'doc-0', 'doc-1')",
+            description:
+              "The document ID to read (e.g. 'doc-0', 'doc-1', or 'active-word-document')",
           },
         },
         required: ["doc_id"],
@@ -270,6 +272,11 @@ export const TOOLS = [
             type: "boolean",
             description:
               "Set to true for landscape page orientation. Default is portrait.",
+          },
+          numberSections: {
+            type: "boolean",
+            description:
+              "Apply legal numbering to section headings. Default is false. Set true only when the user explicitly requests numbered sections/clauses or a workflow, playbook, or source template requires them. Never use it for demand letters, ordinary letters, notices, memos, or reports unless numbering was requested.",
           },
           sections: {
             type: "array",

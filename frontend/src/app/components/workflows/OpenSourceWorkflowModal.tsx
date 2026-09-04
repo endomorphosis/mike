@@ -5,9 +5,13 @@ import { Check, EyeOff, User } from "lucide-react";
 import { openSourceWorkflow } from "@/app/lib/mikeApi";
 import type { WorkflowOpenSourceSubmission } from "@/app/components/shared/types";
 import { Modal } from "@/app/components/modals/Modal";
-import { ModalFieldLabel } from "@/app/components/modals/ModalFieldLabel";
 import { ModalSegmentedToggle } from "@/app/components/modals/ModalSegmentedToggle";
-import { ModalTextInput } from "@/app/components/modals/ModalTextInput";
+import {
+    FieldLabel,
+    FormTextInput,
+} from "@/app/components/ui/form-field";
+import { userFacingApiError } from "@/app/lib/userFacingError";
+import { LIQUID_GLASS_FLAT_CLASS } from "@/shared/ui/LiquidGlassUI";
 
 type OpenSourceContributorMode = "named" | "anonymous";
 type OpenSourceStatus = "idle" | "loading" | "complete";
@@ -112,9 +116,10 @@ export function OpenSourceWorkflowModal({
         } catch (err) {
             setStatus("idle");
             setError(
-                err instanceof Error
-                    ? err.message
-                    : "Failed to submit workflow for review.",
+                userFacingApiError(
+                    err,
+                    "Failed to submit workflow for review.",
+                ),
             );
         }
     }
@@ -188,16 +193,16 @@ export function OpenSourceWorkflowModal({
                         is accepted.
                     </p>
                     {pending && (
-                        <p className="rounded-xl border border-white/70 bg-white/55 px-3 py-2 text-xs leading-5 text-gray-600 shadow-[0_8px_24px_rgba(15,23,42,0.07),inset_0_1px_0_rgba(255,255,255,0.9),inset_0_-1px_0_rgba(255,255,255,0.55)] backdrop-blur-xl">
+                        <p className={`rounded-xl px-3 py-2 text-xs leading-5 text-gray-600 ${LIQUID_GLASS_FLAT_CLASS}`}>
                             You already have a pending submission. This will
                             replace that pending snapshot.
                         </p>
                     )}
 
                     <div className="space-y-2 pt-2">
-                        <ModalFieldLabel as="p">
+                        <FieldLabel as="p">
                             Contributor attribution
-                        </ModalFieldLabel>
+                        </FieldLabel>
                         <ModalSegmentedToggle
                             value={contributorMode}
                             onChange={setContributorMode}
@@ -218,10 +223,10 @@ export function OpenSourceWorkflowModal({
                         {contributorMode === "named" && (
                             <div className="grid gap-x-4 gap-y-5 pt-4 sm:grid-cols-2">
                                 <div>
-                                    <ModalFieldLabel htmlFor="open-source-contributor-name">
+                                    <FieldLabel htmlFor="open-source-contributor-name">
                                         Full Name
-                                    </ModalFieldLabel>
-                                    <ModalTextInput
+                                    </FieldLabel>
+                                    <FormTextInput
                                         id="open-source-contributor-name"
                                         value={contributorName}
                                         onChange={(event) =>
@@ -234,10 +239,10 @@ export function OpenSourceWorkflowModal({
                                     />
                                 </div>
                                 <div>
-                                    <ModalFieldLabel htmlFor="open-source-contributor-organisation">
+                                    <FieldLabel htmlFor="open-source-contributor-organisation">
                                         Organisation
-                                    </ModalFieldLabel>
-                                    <ModalTextInput
+                                    </FieldLabel>
+                                    <FormTextInput
                                         id="open-source-contributor-organisation"
                                         value={contributorOrganisation}
                                         onChange={(event) =>
@@ -250,10 +255,10 @@ export function OpenSourceWorkflowModal({
                                     />
                                 </div>
                                 <div>
-                                    <ModalFieldLabel htmlFor="open-source-contributor-role">
+                                    <FieldLabel htmlFor="open-source-contributor-role">
                                         Role
-                                    </ModalFieldLabel>
-                                    <ModalTextInput
+                                    </FieldLabel>
+                                    <FormTextInput
                                         id="open-source-contributor-role"
                                         value={contributorRole}
                                         onChange={(event) =>
@@ -266,10 +271,10 @@ export function OpenSourceWorkflowModal({
                                     />
                                 </div>
                                 <div>
-                                    <ModalFieldLabel htmlFor="open-source-contributor-linkedin">
+                                    <FieldLabel htmlFor="open-source-contributor-linkedin">
                                         LinkedIn
-                                    </ModalFieldLabel>
-                                    <ModalTextInput
+                                    </FieldLabel>
+                                    <FormTextInput
                                         id="open-source-contributor-linkedin"
                                         type="url"
                                         value={contributorLinkedin}

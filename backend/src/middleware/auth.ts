@@ -1,6 +1,9 @@
 import { Request, Response, NextFunction } from "express";
-import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import { createServerSupabase } from "../lib/supabase";
 import { syncProfileEmail } from "../lib/userLookup";
+import { sendInternalError } from "../lib/httpError";
+import { createRequestSupabase } from "../lib/authSession";
+import { requestOriginIsTrusted } from "../lib/origins";
 
 const isDev = process.env.NODE_ENV !== "production";
 const devLog = (...args: Parameters<typeof console.log>) => {
@@ -21,6 +24,9 @@ function summarizeMfaFactors(
 
 function isLoginMfaBootstrapRoute(req: Request) {
   const path = req.originalUrl.split("?")[0];
+  if (path === "/auth/session" || path.startsWith("/auth/mfa/")) {
+    return true;
+  }
   return (
     (req.method === "GET" || req.method === "POST") &&
     (path === "/user/profile" || path === "/users/profile")
@@ -30,7 +36,7 @@ function isLoginMfaBootstrapRoute(req: Request) {
 async function enforceLoginMfaIfEnabled(
   req: Request,
   res: Response,
-  admin: SupabaseClient<any, "public", any>,
+  admin: ReturnType<typeof createServerSupabase>,
   token: string,
 ) {
   if (isLoginMfaBootstrapRoute(req)) return true;
@@ -50,7 +56,7 @@ async function enforceLoginMfaIfEnabled(
       code: error.code,
     });
     if (error.code === "42703") return true;
-    res.status(500).json({ detail: error.message });
+    sendInternalError(res, error);
     return false;
   }
 
@@ -67,7 +73,14 @@ async function enforceLoginMfaIfEnabled(
       userId: res.locals.userId,
       error: assuranceError.message,
     });
-    res.status(401).json({ detail: assuranceError.message });
+    console.error(
+      "[auth/mfa] login assurance lookup failed",
+      assuranceError,
+    );
+    res.status(401).json({
+      code: "authentication_failed",
+      detail: "Unable to verify authentication. Please sign in again.",
+    });
     return false;
   }
 
@@ -87,48 +100,81 @@ async function enforceLoginMfaIfEnabled(
   return true;
 }
 
+function getAdminClient(res: Response) {
+  try {
+    return createServerSupabase();
+  } catch {
+    res.status(500).json({ detail: "Server auth is not configured" });
+    return null;
+  }
+}
+
 export async function requireAuth(
   req: Request,
   res: Response,
   next: NextFunction,
 ): Promise<void> {
   const auth = req.headers.authorization ?? "";
-  if (!auth.startsWith("Bearer ")) {
-    res.status(401).json({ detail: "Missing or invalid Authorization header" });
+  const admin = getAdminClient(res);
+  if (!admin) return;
+
+  let token = "";
+  let user: Awaited<ReturnType<typeof admin.auth.getUser>>["data"]["user"] =
+    null;
+
+  if (auth.startsWith("Bearer ")) {
+    // Temporary compatibility path for older Word add-ins, load tests, and
+    // API clients. Updated browser clients authenticate with HttpOnly cookies.
+    token = auth.slice(7).trim();
+    const result = await admin.auth.getUser(token);
+    user = result.data.user;
+  } else {
+    if (
+      !["GET", "HEAD", "OPTIONS"].includes(req.method) &&
+      !requestOriginIsTrusted(req.get("origin"))
+    ) {
+      res.status(403).json({
+        code: "untrusted_origin",
+        detail: "The request origin is not allowed.",
+      });
+      return;
+    }
+
+    try {
+      const authClient = createRequestSupabase(req, res);
+      const result = await authClient.auth.getUser();
+      user = result.data.user;
+      if (user) {
+        const sessionResult = await authClient.auth.getSession();
+        token = sessionResult.data.session?.access_token ?? "";
+        res.locals.authClient = authClient;
+        res.locals.authSource = "cookie";
+      }
+    } catch (error) {
+      console.error("[auth] cookie session initialization failed", error);
+      res.status(500).json({ detail: "Server auth is not configured" });
+      return;
+    }
+  }
+
+  if (!user || !token) {
+    res.status(401).json({ detail: "Invalid or expired session" });
     return;
   }
-  const token = auth.slice(7).trim();
 
-  const supabaseUrl = process.env.SUPABASE_URL ?? "";
-  const serviceKey = process.env.SUPABASE_SECRET_KEY ?? "";
-
-  if (!supabaseUrl || !serviceKey) {
-    res.status(500).json({ detail: "Server auth is not configured" });
-    return;
-  }
-
-  const admin = createClient(supabaseUrl, serviceKey, {
-    auth: { persistSession: false },
-  });
-  const { data } = await admin.auth.getUser(token);
-  if (!data.user) {
-    res.status(401).json({ detail: "Invalid or expired token" });
-    return;
-  }
-
-  res.locals.userId = data.user.id;
-  res.locals.userEmail = data.user.email?.toLowerCase() ?? "";
+  res.locals.userId = user.id;
+  res.locals.userEmail = user.email?.toLowerCase() ?? "";
   res.locals.token = token;
   const syncError = await syncProfileEmail(
     admin,
-    data.user.id,
-    data.user.email,
+    user.id,
+    user.email,
   );
   if (syncError) {
     devLog("[auth/profile-email] sync failed", {
       method: req.method,
       path: req.originalUrl,
-      userId: data.user.id,
+      userId: user.id,
       error: syncError.message,
     });
   }
@@ -153,17 +199,8 @@ export async function requireMfaIfEnrolled(
     return;
   }
 
-  const supabaseUrl = process.env.SUPABASE_URL ?? "";
-  const serviceKey = process.env.SUPABASE_SECRET_KEY ?? "";
-
-  if (!supabaseUrl || !serviceKey) {
-    res.status(500).json({ detail: "Server auth is not configured" });
-    return;
-  }
-
-  const admin = createClient(supabaseUrl, serviceKey, {
-    auth: { persistSession: false },
-  });
+  const admin = getAdminClient(res);
+  if (!admin) return;
   const { data, error } =
     await admin.auth.mfa.getAuthenticatorAssuranceLevel(token);
 
@@ -174,7 +211,11 @@ export async function requireMfaIfEnrolled(
       userId: res.locals.userId,
       error: error.message,
     });
-    res.status(401).json({ detail: error.message });
+    console.error("[auth/mfa] assurance lookup failed", error);
+    res.status(401).json({
+      code: "authentication_failed",
+      detail: "Unable to verify authentication. Please sign in again.",
+    });
     return;
   }
 

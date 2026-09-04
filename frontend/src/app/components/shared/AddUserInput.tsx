@@ -7,7 +7,10 @@ import {
     lookupUserByEmail,
     type UserLookupResult,
 } from "@/app/lib/mikeApi";
+import { PillButton } from "@/app/components/ui/pill-button";
 import { cn } from "@/app/lib/utils";
+import { userFacingApiError } from "@/app/lib/userFacingError";
+import { LIQUID_GLASS_SUBTLE_CLASS } from "@/shared/ui/LiquidGlassUI";
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -64,9 +67,10 @@ export function AddUserInput({
             setInput("");
         } catch (err) {
             setError(
-                err instanceof Error
-                    ? err.message
-                    : "Could not add this user. Try again.",
+                userFacingApiError(
+                    err,
+                    "Could not add this user. Try again.",
+                ),
             );
         } finally {
             setChecking(false);
@@ -84,7 +88,7 @@ export function AddUserInput({
         <div>
             <div
                 className={cn(
-                    "flex min-h-10 items-center gap-2 rounded-xl border border-white/70 bg-white/55 px-3 py-1.5 shadow-[0_3px_9px_rgba(15,23,42,0.04),inset_0_1px_0_rgba(255,255,255,0.86),inset_0_-1px_0_rgba(255,255,255,0.58)] backdrop-blur-xl transition-colors focus-within:bg-white/70",
+                    `flex min-h-10 items-center gap-2 rounded-xl px-3 py-1.5 ${LIQUID_GLASS_SUBTLE_CLASS} backdrop-blur-xl transition-colors`,
                     className,
                 )}
             >
@@ -102,19 +106,21 @@ export function AddUserInput({
                     autoFocus={autoFocus}
                 />
                 {showAddButton && (
-                    <button
+                    <PillButton
+                        tone="blue"
+                        size="sm"
                         type="button"
                         onMouseDown={(event) => event.preventDefault()}
                         onClick={() => void commitUser()}
                         disabled={busy || checking}
                         title={submitLabel}
-                        className="inline-flex h-6 shrink-0 items-center gap-1 rounded-full border border-blue-500/35 bg-blue-600/90 px-2.5 text-[11px] font-medium leading-none text-white shadow-[0_3px_9px_rgba(37,99,235,0.10),inset_0_1px_0_rgba(255,255,255,0.28),inset_0_-1px_0_rgba(255,255,255,0.16),inset_0_-4px_9px_rgba(29,78,216,0.2)] backdrop-blur-xl transition-colors hover:bg-blue-600 disabled:cursor-not-allowed disabled:opacity-40"
+                        className="h-6 shrink-0 px-2.5 text-[11px] leading-none"
                     >
                         {(busy || checking) && (
                             <Loader2 className="h-3 w-3 animate-spin" />
                         )}
                         Add
-                    </button>
+                    </PillButton>
                 )}
             </div>
             {error && <p className="mt-1.5 text-xs text-red-500">{error}</p>}

@@ -1,3 +1,4 @@
+import { sealManifest } from "./manifestSigning";
 import { createServerSupabase } from "./supabase";
 
 type Db = ReturnType<typeof createServerSupabase>;
@@ -79,6 +80,22 @@ async function loadUserChats(db: Db, userId: string) {
     return { chats, messages };
 }
 
+async function loadUserWordChats(db: Db, userId: string) {
+    const documents = await selectAll(db, "word_documents", (query) =>
+        query.eq("user_id", userId).order("created_at", { ascending: true }),
+    );
+    const chats = await selectAll(db, "word_chats", (query) =>
+        query.eq("user_id", userId).order("created_at", { ascending: true }),
+    );
+    const messages = await selectByIds(
+        db,
+        "word_chat_messages",
+        "chat_id",
+        idsFrom(chats),
+    );
+    return { documents, chats, messages };
+}
+
 async function loadUserTabularChats(db: Db, userId: string) {
     const chats = await selectAll(db, "tabular_review_chats", (query) =>
         query.eq("user_id", userId).order("created_at", { ascending: true }),
@@ -113,8 +130,9 @@ export async function buildUserChatsExport(
     userId: string,
     userEmail?: string | null,
 ) {
-    const [assistant, tabular] = await Promise.all([
+    const [assistant, wordAddin, tabular] = await Promise.all([
         loadUserChats(db, userId),
+        loadUserWordChats(db, userId),
         loadUserTabularChats(db, userId),
     ]);
 
@@ -122,6 +140,7 @@ export async function buildUserChatsExport(
         exported_at: new Date().toISOString(),
         user: { id: userId, email: userEmail ?? null },
         assistant_chats: assistant,
+        word_addin_chats: wordAddin,
         tabular_review_chats: tabular,
     };
 }
@@ -160,6 +179,115 @@ export async function buildUserTabularReviewsExport(
     };
 }
 
+export function projectManifestFilename(projectId: string) {
+    return `mike-project-manifest-${projectId.slice(0, 8)}-${nowStamp()}.json`;
+}
+
+/**
+ * Tamper-evident manifest for one project: every document version with its
+ * content_sha256, plus the accept/reject trail. To check an exported file
+ * against what the workspace held, recompute its SHA-256 and compare.
+ *
+ * `sealManifest` then hashes the body and signs that digest with the
+ * deployment's Ed25519 key, if it has one. Unsigned, the manifest shows the
+ * *files* are unmodified but says nothing about itself.
+ *
+ * Versions written before content hashing shipped carry a null hash rather
+ * than a wrong one, so an old file set reads as unverifiable and never as
+ * verified.
+ */
+export async function buildProjectExportManifest(db: Db, projectId: string) {
+    const { data: project, error: projectError } = await db
+        .from("projects")
+        .select("id, name, cm_number, created_at")
+        .eq("id", projectId)
+        .single();
+    await throwIfError(projectError, "Failed to export project");
+
+    const documents = await selectAll(
+        db,
+        "documents",
+        (query) =>
+            query
+                .eq("project_id", projectId)
+                .order("created_at", { ascending: true })
+                .order("id", { ascending: true }),
+        "id, project_id, status, current_version_id, created_at",
+    );
+    const documentIds = idsFrom(documents);
+
+    const [versions, edits] = await Promise.all([
+        documentIds.length === 0
+            ? Promise.resolve([])
+            : selectAll(
+                  db,
+                  "document_versions",
+                  (query) =>
+                      query
+                          .in("document_id", documentIds)
+                          .order("created_at", { ascending: true })
+                          .order("id", { ascending: true }),
+                  "id, document_id, version_number, source, filename, file_type, size_bytes, content_sha256, deleted_at, created_at",
+              ),
+        documentIds.length === 0
+            ? Promise.resolve([])
+            : selectAll(
+                  db,
+                  "document_edits",
+                  (query) =>
+                      query
+                          .in("document_id", documentIds)
+                          .order("created_at", { ascending: true })
+                          .order("id", { ascending: true }),
+                  "id, document_id, version_id, change_id, status, created_at, resolved_at",
+              ),
+    ]);
+
+    const groupByDocument = (rows: Record<string, unknown>[]) => {
+        const byDoc = new Map<string, Record<string, unknown>[]>();
+        for (const row of rows) {
+            const docId = row.document_id as string;
+            const list = byDoc.get(docId) ?? [];
+            list.push(row);
+            byDoc.set(docId, list);
+        }
+        return byDoc;
+    };
+    const versionsByDoc = groupByDocument(versions);
+    const editsByDoc = groupByDocument(edits);
+
+    return sealManifest({
+        manifest_version: 1,
+        exported_at: new Date().toISOString(),
+        project,
+        documents: documents.map((doc) => ({
+            id: doc.id,
+            status: doc.status,
+            current_version_id: doc.current_version_id,
+            created_at: doc.created_at,
+            versions: (versionsByDoc.get(doc.id as string) ?? []).map((v) => ({
+                id: v.id,
+                version_number: v.version_number,
+                source: v.source,
+                filename: v.filename,
+                file_type: v.file_type,
+                size_bytes: v.size_bytes,
+                content_sha256: v.content_sha256,
+                deleted_at: v.deleted_at,
+                created_at: v.created_at,
+            })),
+            edits: (editsByDoc.get(doc.id as string) ?? []).map((e) => ({
+                id: e.id,
+                version_id: e.version_id,
+                change_id: e.change_id,
+                status: e.status,
+                created_at: e.created_at,
+                resolved_at: e.resolved_at,
+            })),
+        })),
+    });
+}
+
 export async function buildUserAccountExport(
     db: Db,
     userId: string,
@@ -168,9 +296,12 @@ export async function buildUserAccountExport(
     const [
         profile,
         apiKeys,
+        routerModels,
         projects,
         standaloneDocuments,
         workflows,
+        defaultWorkflowInstallations,
+        quickActions,
         workflowOpenSourceSubmissions,
         hiddenWorkflows,
         workflowSharesByUser,
@@ -180,9 +311,16 @@ export async function buildUserAccountExport(
         tabularReviews,
         sharedProjects,
         sharedTabularReviews,
+        auditEvents,
     ] = await Promise.all([
         selectAll(db, "user_profiles", (query) => query.eq("user_id", userId)),
         loadApiKeyStatus(db, userId),
+        selectAll(db, "user_router_models", (query) =>
+            query
+                .eq("user_id", userId)
+                .order("router", { ascending: true })
+                .order("sort_order", { ascending: true }),
+        ),
         selectAll(db, "projects", (query) =>
             query.eq("user_id", userId).order("created_at", { ascending: true }),
         ),
@@ -194,6 +332,12 @@ export async function buildUserAccountExport(
         ),
         selectAll(db, "workflows", (query) =>
             query.eq("user_id", userId).order("created_at", { ascending: true }),
+        ),
+        selectAll(db, "default_workflow_installations", (query) =>
+            query.eq("user_id", userId).order("installed_at", { ascending: true }),
+        ),
+        selectAll(db, "quick_actions", (query) =>
+            query.eq("user_id", userId).order("sort_order", { ascending: true }),
         ),
         selectAll(db, "workflow_open_source_submissions", (query) =>
             query
@@ -223,7 +367,11 @@ export async function buildUserAccountExport(
         userEmail
             ? selectAll(db, "projects", (query) =>
                   query
-                      .filter("shared_with", "cs", JSON.stringify([userEmail]))
+                      .filter(
+                          "shared_with",
+                          "cs",
+                          JSON.stringify([userEmail.trim().toLowerCase()]),
+                      )
                       .neq("user_id", userId)
                       .order("created_at", { ascending: true }),
                   "id, user_id, name, cm_number, created_at, updated_at",
@@ -238,6 +386,11 @@ export async function buildUserAccountExport(
                   "id, user_id, project_id, title, practice, created_at, updated_at",
               )
             : Promise.resolve([]),
+        selectAll(db, "audit_events", (query) =>
+            query
+                .eq("user_id", userId)
+                .order("created_at", { ascending: true }),
+        ),
     ]);
 
     const projectIds = idsFrom(projects);
@@ -263,12 +416,15 @@ export async function buildUserAccountExport(
         user: { id: userId, email: userEmail ?? null },
         profile,
         api_keys: apiKeys,
+        router_models: routerModels,
         projects,
         project_subfolders: folders,
         documents,
         document_versions: versions,
         document_edits: edits,
         workflows,
+        default_workflow_installations: defaultWorkflowInstallations,
+        quick_actions: quickActions,
         workflow_open_source_submissions: workflowOpenSourceSubmissions,
         hidden_workflows: hiddenWorkflows,
         workflow_shares_by_user: workflowSharesByUser,
@@ -281,5 +437,6 @@ export async function buildUserAccountExport(
             projects: sharedProjects,
             tabular_reviews: sharedTabularReviews,
         },
+        audit_events: auditEvents,
     };
 }

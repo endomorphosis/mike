@@ -17,3 +17,19 @@ next-env.d.ts
 .DS_Store
 .vercel
 coverage
+
+# Playwright artifacts and the bootstrapped e2e session (contains auth tokens)
+test-results/
+playwright-report/
+e2e/.auth/
+
+# Local Supabase scaffold. Keep the shared project configuration reproducible,
+# while excluding CLI state and other generated local files.
+/supabase/
+backend/supabase/*
+!backend/supabase/config.toml
+
+# dev-cycle scratch files
+.current-issue.md
+.implementation-plan.md
+.implement-config

@@ -3,6 +3,9 @@ import type { NextConfig } from "next";
 const nextConfig: NextConfig = {
     /* config options here */
     reactCompiler: true,
+    turbopack: {
+        root: __dirname,
+    },
     async rewrites() {
         return [
             {
@@ -12,6 +15,20 @@ const nextConfig: NextConfig = {
             {
                 source: "/sitemap_:slug.xml",
                 destination: "/api/sitemap/sitemap_:slug.xml",
+            },
+        ];
+    },
+    async redirects() {
+        return [
+            {
+                source: "/account",
+                destination: "/settings",
+                permanent: true,
+            },
+            {
+                source: "/account/:path*",
+                destination: "/settings/:path*",
+                permanent: true,
             },
         ];
     },

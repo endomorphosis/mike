@@ -1,9 +1,12 @@
 import {
   downloadFile,
+  extractedTextKey,
   generatedDocKey,
   uploadFile,
 } from "../../storage";
 import { convertedPdfKey, docxToPdf } from "../../convert";
+import { enqueueConversion } from "../../queue/conversionQueue";
+import { enqueueDbJob, enqueueStorageCleanup } from "../../dbq/enqueue";
 import { createServerSupabase } from "../../supabase";
 import {
   applyTrackedEdits,
@@ -11,7 +14,10 @@ import {
   type EditInput,
 } from "../../docxTrackedChanges";
 import { buildDownloadUrl } from "../../downloadTokens";
-import { loadActiveVersion } from "../../documentVersions";
+import {
+  contentSha256,
+  loadActiveVersion,
+} from "../../documentVersions";
 import {
   type DocStore,
   type DocIndex,
@@ -24,13 +30,18 @@ import {
   isPresentationDocumentType,
   isSpreadsheetDocumentType,
   isWordDocumentType,
+  requiresLibreOfficeTextExtraction,
   shouldConvertToPdf,
 } from "../../documentTypes";
 import { extractPresentationText } from "../../officeText";
 import { spreadsheetToLLMText } from "../../spreadsheet";
 
 
-export function citationReminder(docLabel: string, filename: string): string {
+export function citationReminder(
+  docLabel: string,
+  filename: string,
+  promptFilename: string,
+): string {
   const isSpreadsheet = isSpreadsheetDocumentType(
     filename.split(".").pop() ?? "",
   );
@@ -38,7 +49,8 @@ export function citationReminder(docLabel: string, filename: string): string {
     ? `Use this citation object shape for this spreadsheet: {"ref": 1, "doc_id": "${docLabel}", "quotes": [{"sheet": "Sheet name", "cell": "B7", "quote": "plain cell value"}]}. Cite by "sheet" + "cell" (A1 address or range), not by page.`
     : `Use this citation object shape: {"ref": 1, "doc_id": "${docLabel}", "quotes": [{"page": 1, "quote": "exact verbatim text from the document"}]}. Include top-level "page" and "quote" too only if they match the first quote.`;
   return [
-    `[Citation requirement for ${docLabel} ("${filename}")]:`,
+    `[Citation requirement for ${docLabel}]:`,
+    `Document filename: ${promptFilename}`,
     `If your final answer makes any factual claim from this document, include inline [N] markers and append a final <CITATIONS> JSON block.`,
     `Every citation entry for this document MUST use "doc_id": "${docLabel}".`,
     shapeLine,
@@ -80,12 +92,34 @@ export async function extractPdfText(buf: ArrayBuffer): Promise<string> {
   }
 }
 
+/**
+ * The text read_document derives for the legacy Office types (.doc/.ppt):
+ * LibreOffice → PDF → pdfjs. Exported so the document.precompute_text job
+ * produces byte-identical text to the inline read path — a cache that can
+ * drift from what it caches is worse than no cache.
+ */
+export async function extractLegacyOfficeText(
+  raw: ArrayBuffer,
+): Promise<string> {
+  const pdfBuf = await docxToPdf(Buffer.from(raw));
+  return extractPdfText(
+    pdfBuf.buffer.slice(
+      pdfBuf.byteOffset,
+      pdfBuf.byteOffset + pdfBuf.byteLength,
+    ) as ArrayBuffer,
+  );
+}
+
 export async function generateDocx(
   title: string,
   sections: unknown[],
   userId: string,
   db: ReturnType<typeof createServerSupabase>,
-  options?: { landscape?: boolean; projectId?: string | null },
+  options?: {
+    landscape?: boolean;
+    numberSections?: boolean;
+    projectId?: string | null;
+  },
 ) {
   try {
     const {
@@ -141,6 +175,9 @@ export async function generateDocx(
       HeadingLevel.HEADING_3,
       HeadingLevel.HEADING_4,
     ];
+    // `=== true` is intentional: missing, null, or malformed values must
+    // produce an unnumbered document.
+    const numberSections = options?.numberSections === true;
     const LEGAL_NUMBERING_REF = "legal-clause-numbering";
     const legalNumbering = (level: number) => ({
       reference: LEGAL_NUMBERING_REF,
@@ -322,17 +359,23 @@ export async function generateDocx(
         children.push(new Paragraph({ children: [new PageBreak()] }));
       }
       if (section.heading) {
-        const stripped = stripManualNumbering(section.heading);
+        const stripped = numberSections
+          ? stripManualNumbering(section.heading)
+          : { text: section.heading.trim(), levelFromPrefix: null };
         const isUnnumbered = isUnnumberedHeading(stripped.text, sectionIndex);
         const skipHeading = isTitleLikeFirstHeading(
           stripped.text,
           sectionIndex,
         );
-        const idx = Math.min(
-          stripped.levelFromPrefix ?? (section.level ?? 1) - 1,
-          3,
+        const requestedLevel = Number.isInteger(section.level)
+          ? Number(section.level)
+          : 1;
+        const idx = Math.max(
+          0,
+          Math.min(stripped.levelFromPrefix ?? requestedLevel - 1, 3),
         );
-        currentClauseLevel = isUnnumbered || skipHeading ? null : idx;
+        currentClauseLevel =
+          !numberSections || isUnnumbered || skipHeading ? null : idx;
         const headingText =
           idx === 0 && !isUnnumbered
             ? stripped.text.toUpperCase()
@@ -341,7 +384,10 @@ export async function generateDocx(
           children.push(
             new Paragraph({
               heading: headingLevels[idx],
-              numbering: isUnnumbered ? undefined : legalNumbering(idx),
+              numbering:
+                numberSections && !isUnnumbered
+                  ? legalNumbering(idx)
+                  : undefined,
               spacing: { after: 160 },
               children: [
                 new TextRun({
@@ -422,7 +468,6 @@ export async function generateDocx(
         children.push(new Paragraph({ text: "" }));
       }
       if (section.content) {
-        let numberedBodyParagraphs = 0;
         const contentIsSignatureBlock =
           section.heading &&
           normalizeHeadingText(section.heading).includes("signature")
@@ -435,30 +480,33 @@ export async function generateDocx(
           const rawText = bulletMatch ? bulletMatch[1].trim() : trimmed;
           const manualList = parseManualListMarker(rawText);
           const numeric = stripManualNumbering(rawText);
-          const text = bulletMatch
-            ? rawText
-            : manualList.levelOffset !== null
-              ? manualList.text
-              : numeric.text;
           const inferredLevel =
             currentClauseLevel === null || contentIsSignatureBlock
               ? undefined
               : bulletMatch
-                ? currentClauseLevel + 2
+                ? undefined
                 : manualList.levelOffset !== null
                   ? currentClauseLevel + manualList.levelOffset
                   : numeric.levelFromPrefix !== null
                     ? numeric.levelFromPrefix
-                    : numberedBodyParagraphs === 0
-                      ? currentClauseLevel + 1
-                      : currentClauseLevel + 2;
-          if (currentClauseLevel !== null) numberedBodyParagraphs++;
+                    : undefined;
+          // Strip typed list markers only when Word numbering will replace
+          // them. This preserves intentional text such as "1. Final notice"
+          // in an otherwise unnumbered letter or signature block.
+          const text = bulletMatch
+            ? rawText
+            : inferredLevel === undefined
+              ? rawText
+              : manualList.levelOffset !== null
+                ? manualList.text
+                : numeric.text;
           children.push(
             new Paragraph({
               numbering:
                 inferredLevel === undefined
                   ? undefined
                   : legalNumbering(inferredLevel),
+              bullet: bulletMatch ? { level: 0 } : undefined,
               spacing: { after: 120 },
               children: [
                 new TextRun({
@@ -478,14 +526,16 @@ export async function generateDocx(
       : {};
 
     const doc = new Document({
-      numbering: {
-        config: [
-          {
-            reference: LEGAL_NUMBERING_REF,
-            levels: legalNumberingLevels,
-          },
-        ],
-      },
+      numbering: numberSections
+        ? {
+            config: [
+              {
+                reference: LEGAL_NUMBERING_REF,
+                levels: legalNumberingLevels,
+              },
+            ],
+          }
+        : undefined,
       sections: [{ properties: pageSetup, children }],
     });
     const buf = await Packer.toBuffer(doc);
@@ -550,6 +600,7 @@ export async function generateDocx(
         file_type: "docx",
         size_bytes: buf.byteLength,
         page_count: null,
+        content_sha256: contentSha256(buf),
       })
       .select("id")
       .single();
@@ -953,8 +1004,17 @@ async function persistGeneratedFile(params: {
     contentTypeForDocumentType(extension),
   );
 
+  // PPTX is the only generated type that pays for LibreOffice here (XLSX is
+  // never converted — spreadsheets are served raw). With the async flag on,
+  // the rendition rides the conversion queue instead: the document is
+  // inserted without one and a job fills it in with retries — closing the
+  // sync path's silent failure mode where a LibreOffice hiccup left the doc
+  // permanently rendition-less.
   let pdfStoragePath: string | null = null;
-  if (shouldConvertToPdf(extension)) {
+  const deferRenditionToQueue =
+    shouldConvertToPdf(extension) &&
+    process.env.ASYNC_DOCUMENT_CONVERSION === "true";
+  if (shouldConvertToPdf(extension) && !deferRenditionToQueue) {
     try {
       const pdfBuf = await docxToPdf(buffer);
       const pdfKey = convertedPdfKey(userId, docId);
@@ -1001,6 +1061,7 @@ async function persistGeneratedFile(params: {
       file_type: extension,
       size_bytes: buffer.byteLength,
       page_count: null,
+      content_sha256: contentSha256(buffer),
     })
     .select("id")
     .single();
@@ -1015,6 +1076,27 @@ async function persistGeneratedFile(params: {
     .from("documents")
     .update({ current_version_id: versionId })
     .eq("id", documentId);
+
+  if (deferRenditionToQueue) {
+    // Deduped on convert:<versionId>, retried with backoff.
+    // finalizeDocumentStatus: false — the document was inserted "ready" and
+    // is downloadable from its raw bytes; a rendition failure must not flip
+    // it to "error". Enqueue failure degrades to the sync path's
+    // conversion-failure behavior: a usable document with no rendition.
+    try {
+      await enqueueConversion({
+        documentId,
+        versionId,
+        userId,
+        storagePath: key,
+        fileType: extension,
+        pdfKey: convertedPdfKey(userId, documentId),
+        finalizeDocumentStatus: false,
+      });
+    } catch (err) {
+      devLog(`[generate_${extension}] rendition enqueue failed:`, err);
+    }
+  }
 
   return {
     filename,
@@ -1090,8 +1172,9 @@ export async function generatePpt(
 export async function loadCurrentVersionBytes(
   documentId: string,
   db: ReturnType<typeof createServerSupabase>,
+  versionId?: string | null,
 ): Promise<{ bytes: Buffer; storage_path: string } | null> {
-  const active = await loadActiveVersion(documentId, db);
+  const active = await loadActiveVersion(documentId, db, versionId);
   if (!active) return null;
   const raw = await downloadFile(active.storage_path);
   if (!raw) return null;
@@ -1178,6 +1261,16 @@ export async function runEditDocument(params: {
     newPath = reuseVersion.storagePath;
     versionRowId = reuseVersion.versionId;
     nextVersionNumber = reuseVersion.versionNumber;
+
+    // Clear the hash before the bytes change; the update below sets it again.
+    // Storage and Postgres cannot be written atomically, so a failure between
+    // the two leaves the version unhashed and therefore unverifiable, rather
+    // than hashed against content it no longer holds.
+    await db
+      .from("document_versions")
+      .update({ content_sha256: null })
+      .eq("id", versionRowId);
+
     await uploadFile(
       newPath,
       ab,
@@ -1189,8 +1282,17 @@ export async function runEditDocument(params: {
         file_type: "docx",
         size_bytes: editedBytes.byteLength,
         page_count: null,
+        content_sha256: contentSha256(editedBytes),
+        // The bytes just changed in place — any rendition this version
+        // carried no longer matches them (same invariant as accept/reject).
+        pdf_storage_path: null,
       })
       .eq("id", versionRowId);
+    // Same invariant for the extracted-text cache. In practice this rewrite
+    // always produces DOCX, which is not a cached type, so this is a
+    // no-op-shaped safety net rather than a live invalidation — but it is the
+    // one place a cached key could ever go stale, so it must not be missing.
+    await enqueueStorageCleanup(db, [extractedTextKey(versionRowId)]);
   } else {
     const versionId = crypto.randomUUID().replace(/-/g, "");
     newPath = `documents/${userId}/${documentId}/edits/${versionId}.docx`;
@@ -1240,6 +1342,7 @@ export async function runEditDocument(params: {
         file_type: "docx",
         size_bytes: editedBytes.byteLength,
         page_count: null,
+        content_sha256: contentSha256(editedBytes),
       })
       .select("id")
       .single();
@@ -1340,6 +1443,7 @@ export async function getTurnReadIdentity(params: {
   filename: string;
   documentId?: string;
   versionId?: string | null;
+  versionNumber?: number | null;
   storagePath: string;
 } | null> {
   const { docLabel, docStore, docIndex, db } = params;
@@ -1356,6 +1460,7 @@ export async function getTurnReadIdentity(params: {
         filename: docInfo.filename,
         documentId,
         versionId: active.id,
+        versionNumber: active.version_number,
         storagePath: active.storage_path,
       };
     }
@@ -1367,13 +1472,13 @@ export async function getTurnReadIdentity(params: {
     filename: docInfo.filename,
     documentId,
     versionId: docIndex?.[docLabel]?.version_id ?? null,
+    versionNumber: docIndex?.[docLabel]?.version_number ?? null,
     storagePath: docInfo.storage_path,
   };
 }
 
 export function duplicateReadDocumentResult(identity: {
   docLabel: string;
-  filename: string;
   documentId?: string;
   versionId?: string | null;
 }) {
@@ -1381,7 +1486,6 @@ export function duplicateReadDocumentResult(identity: {
     ok: true,
     already_read: true,
     doc_id: identity.docLabel,
-    filename: identity.filename,
     document_id: identity.documentId,
     version_id: identity.versionId ?? null,
     content:
@@ -1407,7 +1511,10 @@ export async function readDocumentContent(
   write: (s: string) => void,
   docIndex?: DocIndex,
   db?: ReturnType<typeof createServerSupabase>,
-  opts?: { emitEvents?: boolean },
+  opts?: {
+    emitEvents?: boolean;
+    readIdentity?: Awaited<ReturnType<typeof getTurnReadIdentity>>;
+  },
 ): Promise<string> {
   const emitEvents = opts?.emitEvents ?? true;
   devLog(`[read_document] called with docLabel="${docLabel}"`);
@@ -1424,13 +1531,24 @@ export async function readDocumentContent(
   );
 
   const documentId = docIndex?.[docLabel]?.document_id;
+  const readIdentity =
+    opts?.readIdentity ??
+    (emitEvents
+      ? await getTurnReadIdentity({ docLabel, docStore, docIndex, db })
+      : null);
+  const versionId =
+    readIdentity?.versionId ?? docIndex?.[docLabel]?.version_id ?? null;
+  const versionNumber =
+    readIdentity?.versionNumber ?? docIndex?.[docLabel]?.version_number ?? null;
   const emitDocRead = () => {
     if (!emitEvents) return;
     write(
       `data: ${JSON.stringify({
         type: "doc_read",
         filename: docInfo.filename,
-        document_id: documentId,
+        document_id: readIdentity?.documentId ?? documentId,
+        version_id: versionId,
+        version_number: versionNumber,
       })}\n\n`,
     );
   };
@@ -1439,16 +1557,30 @@ export async function readDocumentContent(
       `data: ${JSON.stringify({
         type: "doc_read_start",
         filename: docInfo.filename,
-        document_id: documentId,
+        document_id: readIdentity?.documentId ?? documentId,
+        version_id: versionId,
+        version_number: versionNumber,
       })}\n\n`,
     );
   try {
+    // The Word add-in supplies the active document's plain-text snapshot with
+    // the request. Keep it in the same document-tool pipeline as stored files:
+    // availability metadata is visible up front, but the body is returned only
+    // after the model explicitly calls read_document.
+    if (docInfo.inline_text !== undefined) {
+      devLog(
+        `[read_document] using request-scoped inline text (chars=${docInfo.inline_text.length}) for filename="${docInfo.filename}"`,
+      );
+      emitDocRead();
+      return docInfo.inline_text;
+    }
+
     // Prefer the current tracked-changes version (if any) so read_document
     // reflects accepted/pending edits rather than the original upload.
     let raw: ArrayBuffer | null = null;
     let sourcePath = docInfo.storage_path;
     if (documentId && db) {
-      const current = await loadCurrentVersionBytes(documentId, db);
+      const current = await loadCurrentVersionBytes(documentId, db, versionId);
       if (current) {
         raw = current.bytes.buffer.slice(
           current.bytes.byteOffset,
@@ -1534,19 +1666,42 @@ export async function readDocumentContent(
       isPresentationDocumentType(fileType) ||
       isWordDocumentType(fileType)
     ) {
-      devLog(
-        `[read_document] legacy Office file_type="${fileType}" for filename="${docInfo.filename}", converting to pdf for text extraction`,
-      );
-      const pdfBuf = await docxToPdf(Buffer.from(raw));
-      text = await extractPdfText(
-        pdfBuf.buffer.slice(
-          pdfBuf.byteOffset,
-          pdfBuf.byteOffset + pdfBuf.byteLength,
-        ) as ArrayBuffer,
-      );
-      devLog(
-        `[read_document] legacy Office PDF extraction length=${text.length} for filename="${docInfo.filename}"`,
-      );
+      // This branch is the only one that shells out to LibreOffice — every
+      // other type has an in-process reader above — so it is the only one
+      // worth caching. The cached object is written by the
+      // document.precompute_text job, keyed on the immutable version id.
+      const cacheKey =
+        versionId && requiresLibreOfficeTextExtraction(fileType)
+          ? extractedTextKey(versionId)
+          : null;
+      const cached = cacheKey ? await downloadFile(cacheKey) : null;
+      if (cached) {
+        text = Buffer.from(cached).toString("utf8");
+        devLog(
+          `[read_document] legacy Office text served from cache key="${cacheKey}" length=${text.length} for filename="${docInfo.filename}"`,
+        );
+      } else {
+        devLog(
+          `[read_document] legacy Office file_type="${fileType}" for filename="${docInfo.filename}", converting to pdf for text extraction`,
+        );
+        text = await extractLegacyOfficeText(raw);
+        devLog(
+          `[read_document] legacy Office PDF extraction length=${text.length} for filename="${docInfo.filename}"`,
+        );
+        // Warm the cache for the next read of this version. Fire-and-forget
+        // and deduped: several tool calls in one turn queue one job, and a
+        // failure here must never affect the text we just produced.
+        if (cacheKey && db) {
+          void enqueueDbJob(db, {
+            kind: "document.precompute_text",
+            payload: { versionId, storagePath: sourcePath, fileType },
+            dedupeKey: `precompute:${versionId}`,
+            maxAttempts: 3,
+          }).catch((err) =>
+            devLog(`[read_document] precompute enqueue failed`, err),
+          );
+        }
+      }
     } else {
       devLog(
         `[read_document] unknown file_type="${docInfo.file_type}" for filename="${docInfo.filename}", trying mammoth`,
@@ -1572,20 +1727,42 @@ export async function readDocumentContent(
     );
     if (emitEvents)
       write(
-        `data: ${JSON.stringify({ type: "doc_read", filename: docInfo.filename })}\n\n`,
+        `data: ${JSON.stringify({
+          type: "doc_read",
+          filename: docInfo.filename,
+          document_id: readIdentity?.documentId ?? documentId,
+          version_id: versionId,
+          version_number: versionNumber,
+        })}\n\n`,
       );
     return "Document could not be read.";
   }
 }
 
+/** A character is "punctuation" for tolerant matching if it is not a letter,
+ *  number, or whitespace. Dropped entirely (not replaced with a space) so
+ *  "U.S." collapses to "us" and "plaintiff's" to "plaintiffs". */
+function isPunctuation(ch: string): boolean {
+  return !/[\p{L}\p{N}\s]/u.test(ch);
+}
+
 /**
  * Build a whitespace-collapsed, lowercased copy of `text`, plus a map from
  * each character index in the normalized form back to the corresponding
- * index in the original text. Used by `findInDocumentContent` so matches
- * are tolerant of case + whitespace variance but can still return the
- * exact original excerpt.
+ * index in the original text. Used by `findInDocumentContent` (and server-side
+ * citation verification) so matches are tolerant of case + whitespace variance
+ * but can still return the exact original excerpt.
+ *
+ * With `stripPunctuation`, punctuation characters are removed from the
+ * normalized form too, making matching tolerant of punctuation drift (e.g. a
+ * model that adds a stray comma or drops a period). The index map still points
+ * back at the surviving original characters so the recovered excerpt is exact.
  */
-function normalizeWithMap(text: string): { norm: string; origIdx: number[] } {
+export function normalizeWithMap(
+  text: string,
+  opts: { stripPunctuation?: boolean } = {},
+): { norm: string; origIdx: number[] } {
+  const stripPunctuation = opts.stripPunctuation ?? false;
   const norm: string[] = [];
   const origIdx: number[] = [];
   let prevSpace = false;
@@ -1597,6 +1774,10 @@ function normalizeWithMap(text: string): { norm: string; origIdx: number[] } {
         origIdx.push(i);
         prevSpace = true;
       }
+    } else if (stripPunctuation && isPunctuation(ch)) {
+      // Drop punctuation without disturbing the space-collapsing state so
+      // "foo, bar" -> "foo bar" but "U.S." -> "us".
+      continue;
     } else {
       norm.push(ch.toLowerCase());
       origIdx.push(i);
@@ -1672,6 +1853,7 @@ export async function findInDocumentContent(params: {
   write: (s: string) => void;
   docIndex?: DocIndex;
   db?: ReturnType<typeof createServerSupabase>;
+  readIdentity?: Awaited<ReturnType<typeof getTurnReadIdentity>>;
 }): Promise<string> {
   const {
     docLabel,
@@ -1695,6 +1877,14 @@ export async function findInDocumentContent(params: {
       error: `Document '${docLabel}' not found.`,
     });
   }
+  const documentId = docIndex?.[docLabel]?.document_id;
+  const readIdentity =
+    params.readIdentity ??
+    (await getTurnReadIdentity({ docLabel, docStore, docIndex, db }));
+  const versionId =
+    readIdentity?.versionId ?? docIndex?.[docLabel]?.version_id ?? null;
+  const versionNumber =
+    readIdentity?.versionNumber ?? docIndex?.[docLabel]?.version_number ?? null;
 
   // Announce the search to the UI, then reuse readDocumentContent for its
   // fallbacks — but suppress its own doc_read events so the user only sees
@@ -1703,6 +1893,9 @@ export async function findInDocumentContent(params: {
     `data: ${JSON.stringify({
       type: "doc_find_start",
       filename: docInfo.filename,
+      document_id: readIdentity?.documentId ?? documentId,
+      version_id: versionId,
+      version_number: versionNumber,
       query,
     })}\n\n`,
   );
@@ -1713,13 +1906,16 @@ export async function findInDocumentContent(params: {
     write,
     docIndex,
     db,
-    { emitEvents: false },
+    { emitEvents: false, readIdentity },
   );
   if (!text || text === "Document could not be read.") {
     write(
       `data: ${JSON.stringify({
         type: "doc_find",
         filename: docInfo.filename,
+        document_id: readIdentity?.documentId ?? documentId,
+        version_id: versionId,
+        version_number: versionNumber,
         query,
         total_matches: 0,
       })}\n\n`,
@@ -1750,6 +1946,9 @@ export async function findInDocumentContent(params: {
     `data: ${JSON.stringify({
       type: "doc_find",
       filename: docInfo.filename,
+      document_id: readIdentity?.documentId ?? documentId,
+      version_id: versionId,
+      version_number: versionNumber,
       query,
       total_matches: totalMatches,
     })}\n\n`,
@@ -1787,6 +1986,7 @@ export type TurnReadState = Map<
     filename: string;
     documentId?: string;
     versionId?: string | null;
+    versionNumber?: number | null;
     storagePath: string;
   }
 >;

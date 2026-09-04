@@ -1,7 +1,9 @@
 import { useState, type ReactNode } from "react";
-import { ChevronDown, Loader2 } from "lucide-react";
+import { Loader2 } from "lucide-react";
+import { EditCardsSectionUI } from "@/shared/ui/EditCardsSectionUI";
+import { GLASS_CARD_SURFACE_CLASS } from "@/app/components/ui/glass-card";
 import { PillButton } from "@/app/components/ui/pill-button";
-import { supabase } from "@/app/lib/supabase";
+import { resolveDocumentEdit } from "@/app/lib/mikeApi";
 import type { EditAnnotation } from "../../shared/types";
 import { applyOptimisticResolution } from "../EditCard";
 
@@ -60,13 +62,6 @@ function BulkEditActions({
         setBusy(verb);
         setProgress({ done: 0, total: pending.length });
         try {
-            const {
-                data: { session },
-            } = await supabase.auth.getSession();
-            const token = session?.access_token;
-            const apiBase =
-                process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:3001";
-
             // Sequential so the per-document version counter advances in a
             // predictable order and the viewer doesn't race between bumps.
             let done = 0;
@@ -88,22 +83,11 @@ function BulkEditActions({
                     );
                 }
                 try {
-                    const resp = await fetch(
-                        `${apiBase}/single-documents/${annotation.document_id}/edits/${annotation.edit_id}/${verb}`,
-                        {
-                            method: "POST",
-                            headers: token
-                                ? { Authorization: `Bearer ${token}` }
-                                : undefined,
-                        },
+                    const data = await resolveDocumentEdit(
+                        annotation.document_id,
+                        annotation.edit_id,
+                        verb,
                     );
-                    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-                    const data = (await resp.json()) as {
-                        ok: boolean;
-                        status?: "accepted" | "rejected";
-                        version_id: string | null;
-                        download_url: string | null;
-                    };
                     const nextStatus =
                         data.status ??
                         (verb === "accept" ? "accepted" : "rejected");
@@ -148,17 +132,24 @@ function BulkEditActions({
     const first = pending[0];
 
     return (
-        <div className="flex items-center gap-2">
+        <div className="flex w-full items-center gap-2">
             <PillButton
-                tone="black"
+                tone="blue"
                 size="sm"
                 onClick={() => handleAll("accept")}
                 disabled={!!busy}
             >
-                {busy === "accept" && (
-                    <Loader2 className="h-3 w-3 animate-spin" />
+                {busy === "accept" ? (
+                    <>
+                        <Loader2
+                            aria-hidden="true"
+                            className="h-3 w-3 animate-spin"
+                        />
+                        Accepting all...
+                    </>
+                ) : (
+                    "Accept all"
                 )}
-                Accept all
             </PillButton>
             <PillButton
                 tone="white"
@@ -166,19 +157,26 @@ function BulkEditActions({
                 onClick={() => handleAll("reject")}
                 disabled={!!busy}
             >
-                {busy === "reject" && (
-                    <Loader2 className="h-3 w-3 animate-spin" />
+                {busy === "reject" ? (
+                    <>
+                        <Loader2
+                            aria-hidden="true"
+                            className="h-3 w-3 animate-spin"
+                        />
+                        Rejecting all...
+                    </>
+                ) : (
+                    "Reject all"
                 )}
-                Reject all
             </PillButton>
             {progress && (
-                <span className="text-xs font-serif text-gray-500">
+                <span className="text-xs font-sans text-gray-500">
                     {progress.done}/{progress.total}
                 </span>
             )}
             {onViewClick && first && (
                 <PillButton
-                    tone="blue"
+                    tone="black"
                     size="sm"
                     onClick={() =>
                         onViewClick(first.annotation, first.filename)
@@ -235,7 +233,6 @@ export function EditCardsSection({
         message: string;
     }) => void;
 }) {
-    const [isOpen, setIsOpen] = useState(true);
     if (cards.length === 0) return null;
 
     const docCount = filenameByDocId.size;
@@ -249,25 +246,11 @@ export function EditCardsSection({
               : `${resolvedCount} resolved tracked ${resolvedCount === 1 ? "change" : "changes"}`;
 
     return (
-        <div className="rounded-xl bg-white shadow-[0_3px_9px_rgba(15,23,42,0.03),inset_0_1px_0_rgba(255,255,255,0.9),inset_0_-4px_9px_rgba(255,255,255,0.05)] backdrop-blur-2xl overflow-hidden">
-            {/* Row 1: summary + chevron */}
-            <div className="flex items-center gap-2 px-3 pt-3">
-                <p className="flex-1 min-w-0 text-sm font-serif text-gray-700 truncate">
-                    {summary}
-                </p>
-                <button
-                    onClick={() => setIsOpen((v) => !v)}
-                    aria-label={isOpen ? "Collapse edits" : "Expand edits"}
-                    className="shrink-0 rounded p-1 text-gray-500 hover:bg-gray-100 hover:text-gray-800 transition-colors"
-                >
-                    <ChevronDown
-                        className={`h-4 w-4 transition-transform duration-200 ${isOpen ? "" : "-rotate-90"}`}
-                    />
-                </button>
-            </div>
-            {/* Row 2: bulk action buttons */}
-            {pending.length > 0 && (
-                <div className="px-3 pt-3">
+        <EditCardsSectionUI
+            summary={summary}
+            className={`${GLASS_CARD_SURFACE_CLASS} overflow-hidden`}
+            actions={
+                pending.length > 0 ? (
                     <BulkEditActions
                         pending={pending}
                         onViewClick={onViewClick}
@@ -275,15 +258,10 @@ export function EditCardsSection({
                         onResolved={onResolved}
                         onError={onError}
                     />
-                </div>
-            )}
-            {/* Row 3: collapsible cards list */}
-            {isOpen && (
-                <div className="flex flex-col gap-2 px-3 pb-3 pt-3">
-                    {cards}
-                </div>
-            )}
-            {!isOpen && <div className="pb-3" />}
-        </div>
+                ) : undefined
+            }
+        >
+            {cards}
+        </EditCardsSectionUI>
     );
 }

@@ -1,25 +1,42 @@
 "use client";
 
-import { forwardRef, useImperativeHandle, useRef, useState } from "react";
-import { Loader2, Plus, Table2, Upload } from "lucide-react";
+import {
+    forwardRef,
+    useImperativeHandle,
+    useRef,
+    useState,
+} from "react";
+import { Loader2, Plus, Upload } from "lucide-react";
 import type {
     ColumnConfig,
     Document,
     TabularCell,
+    TabularReviewRow,
 } from "../shared/types";
 import { TabularCell as TabularCellComponent } from "./TabularCell";
 import { TREditColumnMenu } from "./TREditColumnMenu";
 import {
     TABLE_CHECKBOX_CLASS,
-    SkeletonDot,
+    SkeletonCheckbox,
     SkeletonLine,
+    TableScrollArea,
 } from "../shared/TablePrimitive";
+import { EmptyState } from "@/app/components/ui/empty-state";
+import { PillButton } from "@/app/components/ui/pill-button";
+import { TabularReviewSkeuoIcon } from "@/app/components/shared/AppSidebarSkeuoIcons";
+import { TRFirstColumnCell } from "./TRFirstColumnCell";
+import {
+    LIQUID_GLASS_SELECTED_CLASS,
+    LIQUID_GLASS_GROUP_HOVER_CLASS,
+    LIQUID_GLASS_HOVER_CLASS,
+} from "@/app/components/ui/liquid-surface";
 
 const SKELETON_COLS = 4;
 const SKELETON_ROWS = 5;
 
 const COL_W = "w-[300px] shrink-0";
 const DOC_COL_W = "w-[332px] shrink-0";
+const TR_STICKY_CELL_CLASS = "table-sticky-cell";
 
 // Pixel widths matching the CSS constants above
 const DOC_COL_W_PX = 332;
@@ -32,18 +49,29 @@ export interface TRTableHandle {
 
 interface Props {
     loading: boolean;
+    documentGrouping: "document" | "folder";
     columns: ColumnConfig[];
+    rows: TabularReviewRow[];
     documents: Document[];
     cells: TabularCell[];
     savingColumn: boolean;
     savingColumnsConfig: boolean;
-    selectedDocIds: string[];
+    selectedRowIds: string[];
     uploadingFilenames?: string[];
     dragOverFiles?: boolean;
     highlightedCell?: { colIdx: number; rowIdx: number } | null;
     onSelectionChange: (ids: string[]) => void;
+    onDocumentOpen: (row: TabularReviewRow, document: Document) => void;
     onExpand: (cell: TabularCell) => void;
-    onCitationClick: (cell: TabularCell, page: number, quote: string) => void;
+    onCitationClick: (
+        cell: TabularCell,
+        page: number | undefined,
+        quote: string,
+        citationRef: number,
+        sheet?: string,
+        citationCell?: string,
+        documentId?: string,
+    ) => void;
     onUpdateColumn: (col: ColumnConfig) => void;
     onDeleteColumn: (colIndex: number) => void;
     onAddColumn: () => void;
@@ -53,16 +81,19 @@ interface Props {
 export const TRTable = forwardRef<TRTableHandle, Props>(function TRTable(
     {
         loading,
+        documentGrouping,
         columns,
+        rows,
         documents,
         cells,
         savingColumn,
         savingColumnsConfig,
-        selectedDocIds,
+        selectedRowIds,
         uploadingFilenames = [],
         dragOverFiles = false,
         highlightedCell,
         onSelectionChange,
+        onDocumentOpen,
         onExpand,
         onCitationClick,
         onUpdateColumn,
@@ -72,20 +103,11 @@ export const TRTable = forwardRef<TRTableHandle, Props>(function TRTable(
     },
     ref,
 ) {
-    const stickyCellBg = "bg-[#fafbfc]";
     const scrollContainerRef = useRef<HTMLDivElement>(null);
-    const headerRef = useRef<HTMLDivElement>(null);
     const lastScrollLeftRef = useRef(0);
     const [scrollCloseSignal, setScrollCloseSignal] = useState(0);
 
-    function syncHeader() {
-        if (headerRef.current && scrollContainerRef.current) {
-            headerRef.current.scrollLeft = scrollContainerRef.current.scrollLeft;
-        }
-    }
-
     function handleRowsScroll() {
-        syncHeader();
         const container = scrollContainerRef.current;
         if (!container) return;
 
@@ -96,6 +118,11 @@ export const TRTable = forwardRef<TRTableHandle, Props>(function TRTable(
     }
 
     const sortedColumns = [...columns].sort((a, b) => a.index - b.index);
+    const documentsById = new Map(
+        documents.map((document) => [document.id, document]),
+    );
+    const firstColumnLabel =
+        documentGrouping === "folder" ? "Folder / Document" : "Document";
     const totalContentWidth =
         DOC_COL_W_PX + sortedColumns.length * DATA_COL_W_PX + 32;
     const skeletonContentWidth =
@@ -127,48 +154,48 @@ export const TRTable = forwardRef<TRTableHandle, Props>(function TRTable(
         },
     }));
 
-    function getCell(docId: string, colIdx: number) {
+    function getCell(row: TabularReviewRow, colIdx: number) {
         return cells.find(
-            (c) => c.document_id === docId && c.column_index === colIdx,
+            (cell) =>
+                cell.row_id === row.id && cell.column_index === colIdx,
         );
     }
 
     const allSelected =
-        documents.length > 0 &&
-        documents.every((d) => selectedDocIds.includes(d.id));
+        rows.length > 0 && rows.every((row) => selectedRowIds.includes(row.id));
     const someSelected =
-        !allSelected && documents.some((d) => selectedDocIds.includes(d.id));
+        !allSelected && rows.some((row) => selectedRowIds.includes(row.id));
 
     function toggleAll() {
         if (allSelected) {
             onSelectionChange([]);
         } else {
-            onSelectionChange(documents.map((d) => d.id));
+            onSelectionChange(rows.map((row) => row.id));
         }
     }
 
-    function toggleDoc(id: string) {
-        if (selectedDocIds.includes(id)) {
-            onSelectionChange(selectedDocIds.filter((x) => x !== id));
+    function toggleRow(id: string) {
+        if (selectedRowIds.includes(id)) {
+            onSelectionChange(selectedRowIds.filter((x) => x !== id));
         } else {
-            onSelectionChange([...selectedDocIds, id]);
+            onSelectionChange([...selectedRowIds, id]);
         }
     }
 
     if (loading) {
         return (
-            <div className="flex flex-1 flex-col overflow-hidden">
-                {/* Header */}
-                <div className="shrink-0 overflow-hidden">
+            <TableScrollArea
+                preserveGridBorder
+                header={
                     <div
-                        className={`flex h-8 ${stickyCellBg}`}
+                        className="flex h-10 shrink-0"
                         style={{ minWidth: skeletonContentWidth }}
                     >
                         <div
-                            className={`${DOC_COL_W} flex items-center gap-4 border-b border-r border-gray-200 py-2 pl-4 pr-2 text-xs font-medium text-gray-500`}
+                            className={`sticky left-0 z-[80] ${DOC_COL_W} ${TR_STICKY_CELL_CLASS} flex items-center border-b border-r border-gray-200 py-2 pl-3 pr-2 text-xs font-medium text-gray-700`}
                         >
-                            <SkeletonDot />
-                            <span>Document</span>
+                            <SkeletonCheckbox />
+                            <span>{firstColumnLabel}</span>
                         </div>
                         {Array.from({ length: SKELETON_COLS }).map((_, i) => (
                             <div
@@ -180,17 +207,17 @@ export const TRTable = forwardRef<TRTableHandle, Props>(function TRTable(
                         ))}
                         <div className="flex-1 border-b border-gray-200 min-w-8" />
                     </div>
-                </div>
-                {/* Rows */}
-                <div className="flex flex-1 flex-col overflow-auto min-h-0">
+                }
+            >
                     {Array.from({ length: SKELETON_ROWS }).map((_, row) => (
                         <div
                             key={row}
-                            className={`flex h-10 ${row % 2 === 0 ? stickyCellBg : "bg-gray-50"}`}
+                            className="flex h-8"
                             style={{ minWidth: skeletonContentWidth }}
                         >
-                            <div className={`${DOC_COL_W} flex items-center gap-4 border-b border-r border-gray-200 py-2 pl-4 pr-2`}>
-                                <SkeletonDot />
+                            <div className={`${TR_STICKY_CELL_CLASS} sticky left-0 z-[60] ${DOC_COL_W} flex items-center border-b border-r border-gray-200 py-2 pl-3 pr-2`}>
+                                <SkeletonCheckbox />
+                                <div className="mr-2 h-3.5 w-3.5 shrink-0 rounded bg-gray-100 animate-pulse" />
                                 <SkeletonLine className="h-4 w-32" />
                             </div>
                             {Array.from({ length: SKELETON_COLS }).map((_, col) => (
@@ -204,69 +231,78 @@ export const TRTable = forwardRef<TRTableHandle, Props>(function TRTable(
                             <div className="flex-1 border-b border-gray-200 min-w-8" />
                         </div>
                     ))}
-                </div>
-            </div>
+            </TableScrollArea>
         );
     }
 
     if (
         columns.length === 0 &&
-        documents.length === 0 &&
+        rows.length === 0 &&
         uploadingFilenames.length === 0
     ) {
         return (
-            <div className="flex flex-1 flex-col overflow-hidden">
-                <div className={`shrink-0 flex items-center border-b border-gray-200 ${stickyCellBg}`}>
-                    <div
-                        className={`${DOC_COL_W} border-r border-gray-200 py-2 pl-4 pr-2 text-xs font-medium text-gray-500 select-none`}
-                    >
-                        Document
+            <TableScrollArea
+                preserveGridBorder
+                header={
+                    <div className="shrink-0 flex h-10 items-center border-b border-gray-200">
+                        <div
+                            className={`${DOC_COL_W} ${TR_STICKY_CELL_CLASS} flex items-center border-r border-gray-200 py-2 pl-3 pr-2 text-xs font-medium text-gray-700 select-none`}
+                        >
+                            {firstColumnLabel}
+                        </div>
+                        <div className="flex-1" />
                     </div>
-                    <div className="flex-1" />
-                </div>
+                }
+            >
                 <div className="relative flex min-h-0 flex-1">
                     {dragOverFiles && (
                         <div className="absolute inset-0 z-[90] border-2 border-blue-400 bg-blue-50/40 pointer-events-none" />
                     )}
-                    <div className="flex flex-1 flex-col items-start justify-center w-full max-w-xs mx-auto">
-                        <Table2 className="h-8 w-8 text-gray-300 mb-4" />
-                        <p className="text-2xl font-medium font-serif text-gray-900">
-                            Tabular Review
-                        </p>
-                        <p className="mt-1 text-xs text-gray-400 text-left">
-                            Add columns and documents to get started.
-                        </p>
-                        <div className="mt-4 flex items-center gap-2">
-                            <button
-                                onClick={onAddColumn}
-                                className="inline-flex items-center gap-1 rounded-full bg-gray-900 px-3 py-1 text-xs font-medium text-white transition-colors hover:bg-gray-700 shadow-md"
-                            >
-                                + Add Columns
-                            </button>
-                            <button
-                                onClick={onAddDocuments}
-                                className="inline-flex items-center gap-1.5 rounded-full border border-gray-200 bg-white px-3 py-1 text-xs font-medium text-gray-600 hover:bg-gray-50 transition-colors shadow-sm"
-                            >
-                                <Upload className="h-3.5 w-3.5" />
-                                Add Documents
-                            </button>
-                        </div>
-                    </div>
+                    <EmptyState
+                        className="mx-auto w-full max-w-xs flex-1 justify-center"
+                        icon={<TabularReviewSkeuoIcon />}
+                        title="Tabular Review"
+                        description="Add columns and documents to get started."
+                        action={
+                            <div className="flex items-center gap-2">
+                                <PillButton
+                                    tone="black"
+                                    size="sm"
+                                    onClick={onAddColumn}
+                                    className="px-3"
+                                >
+                                    <Plus className="h-3.5 w-3.5" />
+                                    Add Columns
+                                </PillButton>
+                                <PillButton
+                                    tone="white"
+                                    size="sm"
+                                    onClick={onAddDocuments}
+                                    className="px-3"
+                                >
+                                    <Upload className="h-3.5 w-3.5" />
+                                    Add Documents
+                                </PillButton>
+                            </div>
+                        }
+                    />
                 </div>
-            </div>
+            </TableScrollArea>
         );
     }
 
     return (
-        <div className="flex flex-1 flex-col overflow-hidden">
-            {/* Header */}
-            <div ref={headerRef} className="shrink-0 overflow-hidden">
+        <TableScrollArea
+            preserveGridBorder
+            scrollRef={scrollContainerRef}
+            onScroll={handleRowsScroll}
+            header={
                 <div
-                    className={`flex h-8 ${stickyCellBg}`}
+                    className="z-[70] flex h-10 shrink-0"
                     style={{ minWidth: totalContentWidth }}
                 >
                     <div
-                        className={`sticky left-0 z-[80] ${DOC_COL_W} ${stickyCellBg} border-b border-r border-gray-200 flex items-center gap-4 py-2 pl-4 pr-2 text-left text-xs font-medium text-gray-500 select-none`}
+                        className={`sticky left-0 z-[80] ${DOC_COL_W} ${TR_STICKY_CELL_CLASS} border-b border-r border-gray-200 flex items-center py-2 pl-3 pr-2 text-left text-xs font-medium text-gray-700 select-none`}
                     >
                         <input
                             type="checkbox"
@@ -276,16 +312,17 @@ export const TRTable = forwardRef<TRTableHandle, Props>(function TRTable(
                             }}
                             onChange={toggleAll}
                             className={TABLE_CHECKBOX_CLASS}
+                            aria-label={`Select all ${firstColumnLabel.toLowerCase()}`}
                         />
-                        <span>Document</span>
+                        <span>{firstColumnLabel}</span>
                     </div>
                     {columns.map((col) => (
                         <div
                             key={col.index}
                             data-tr-col-header
-                            className={`${COL_W} border-b border-r border-gray-200 p-2 text-left text-xs font-medium text-gray-500 select-none`}
+                            className={`${COL_W} flex items-center border-b border-r border-gray-200 p-2 text-left text-xs font-medium text-gray-700 select-none`}
                         >
-                            <div className="flex items-center justify-between gap-3">
+                            <div className="flex min-w-0 flex-1 items-center justify-between gap-3">
                                 <span className="truncate">{col.name}</span>
                                 <TREditColumnMenu
                                     column={col}
@@ -307,33 +344,28 @@ export const TRTable = forwardRef<TRTableHandle, Props>(function TRTable(
                         </button>
                     </div>
                 </div>
-            </div>
-
-            {/* Rows */}
-            <div
-                className="flex flex-1 flex-col overflow-auto min-h-0"
-                ref={scrollContainerRef}
-                onScroll={handleRowsScroll}
-            >
-            <div className="relative min-h-0 flex-1">
-                {dragOverFiles && (
-                    <div className="absolute inset-0 z-[90] border-2 border-blue-400 bg-blue-50/40 pointer-events-none" />
-                )}
-                {uploadingFilenames.map((filename) => (
+            }
+        >
+                <div className="relative min-h-0 flex-1">
+                    {dragOverFiles && (
+                        <div className="absolute inset-0 z-[90] border-2 border-blue-400 bg-blue-50/40 pointer-events-none" />
+                    )}
+                    {uploadingFilenames.map((filename) => (
                     <div
                         key={`uploading-${filename}`}
-                        className="flex h-10"
+                        className="flex h-8"
                         style={{ minWidth: totalContentWidth }}
                     >
                         <div
-                            className={`sticky left-0 z-[60] ${DOC_COL_W} ${stickyCellBg} border-b border-r border-gray-200 py-2 pl-4 pr-2 text-xs text-gray-400 flex items-center gap-4`}
+                            className={`${TR_STICKY_CELL_CLASS} sticky left-0 z-[60] ${DOC_COL_W} border-b border-r border-gray-200 py-2 pl-3 pr-2 text-xs text-gray-400 flex items-center`}
                         >
                             <input
                                 type="checkbox"
                                 disabled
-                                className="h-2.5 w-2.5 shrink-0 rounded border-gray-200 cursor-default accent-black disabled:opacity-100"
+                                className="mr-3 h-2.5 w-2.5 shrink-0 rounded border-gray-200 cursor-default accent-black disabled:opacity-100"
+                                aria-label={`Select ${filename}`}
                             />
-                            <Loader2 className="h-3.5 w-3.5 animate-spin shrink-0" />
+                            <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin shrink-0" />
                             <span className="line-clamp-1" title={filename}>
                                 {filename}
                             </span>
@@ -348,43 +380,45 @@ export const TRTable = forwardRef<TRTableHandle, Props>(function TRTable(
                         ))}
                         <div className="flex-1 border-b border-gray-200 min-h-8 min-w-8" />
                     </div>
-                ))}
-                {documents.map((doc, docIdx) => {
-                    const baseRowBg =
-                        docIdx % 2 === 0 ? stickyCellBg : "bg-gray-50";
-                    const rowBg = selectedDocIds.includes(doc.id)
-                        ? "bg-gray-100"
-                        : baseRowBg;
+                    ))}
+                    {rows.map((row, rowIdx) => {
+                    const isSelected = selectedRowIds.includes(row.id);
+                    const sourceDocuments = row.source_document_ids
+                        .map((documentId) => documentsById.get(documentId))
+                        .filter(
+                            (document): document is Document => !!document,
+                        );
+                    const rowBg = isSelected
+                        ? LIQUID_GLASS_SELECTED_CLASS
+                        : LIQUID_GLASS_HOVER_CLASS;
+                    const stickyRowBg = isSelected
+                        ? LIQUID_GLASS_SELECTED_CLASS
+                        : "";
                     return (
                         <div
-                            key={doc.id}
-                            className={`flex ${rowBg}`}
+                            key={row.id}
+                            className={`group flex transition-colors ${rowBg}`}
                             style={{ minWidth: totalContentWidth }}
                         >
-                            <div
-                                className={`sticky left-0 z-[60] ${DOC_COL_W} border-b border-r border-gray-200 py-2 pl-4 pr-2 text-xs text-gray-800 flex items-center gap-4 ${rowBg}`}
-                            >
-                                <input
-                                    type="checkbox"
-                                    checked={selectedDocIds.includes(doc.id)}
-                                    onChange={() => toggleDoc(doc.id)}
-                                    className={TABLE_CHECKBOX_CLASS}
-                                />
-                                <span
-                                    className="line-clamp-1"
-                                    title={doc.filename}
-                                >
-                                    {doc.filename}
-                                </span>
-                            </div>
+                            <TRFirstColumnCell
+                                row={row}
+                                sourceDocuments={sourceDocuments}
+                                selected={isSelected}
+                                closeSignal={scrollCloseSignal}
+                                onToggleSelection={() => toggleRow(row.id)}
+                                onDocumentOpen={(document) =>
+                                    onDocumentOpen(row, document)
+                                }
+                                className={`${TR_STICKY_CELL_CLASS} sticky left-0 z-[60] ${DOC_COL_W} border-b border-r border-gray-200 py-2 pl-3 pr-2 text-xs text-gray-800 flex items-center transition-colors ${stickyRowBg} ${isSelected ? "" : LIQUID_GLASS_GROUP_HOVER_CLASS}`}
+                            />
                             {columns.map((col) => {
-                                const cell = getCell(doc.id, col.index);
+                                const cell = getCell(row, col.index);
                                 const colPos = sortedColumns.findIndex(
                                     (c) => c.index === col.index,
                                 );
                                 const isHighlighted =
                                     highlightedCell?.colIdx === colPos &&
-                                    highlightedCell?.rowIdx === docIdx;
+                                    highlightedCell?.rowIdx === rowIdx;
                                 return (
                                     <div
                                         key={col.index}
@@ -399,11 +433,19 @@ export const TRTable = forwardRef<TRTableHandle, Props>(function TRTable(
                                                 onCitationClick={(
                                                     page,
                                                     quote,
+                                                    citationRef,
+                                                    sheet,
+                                                    citationCell,
+                                                    documentId,
                                                 ) =>
                                                     onCitationClick(
                                                         cell,
                                                         page,
                                                         quote,
+                                                        citationRef,
+                                                        sheet,
+                                                        citationCell,
+                                                        documentId,
                                                     )
                                                 }
                                             />
@@ -414,9 +456,8 @@ export const TRTable = forwardRef<TRTableHandle, Props>(function TRTable(
                             <div className="flex-1 border-b border-gray-200 min-h-8 min-w-8" />
                         </div>
                     );
-                })}
-            </div>
-            </div>
-        </div>
+                    })}
+                </div>
+        </TableScrollArea>
     );
 });

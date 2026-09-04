@@ -12,13 +12,13 @@ import {
     useState,
 } from "react";
 import { useRouter, useSelectedLayoutSegments } from "next/navigation";
+import { ChevronLeft } from "lucide-react";
 import {
     createTabularReview,
     deleteProject,
     getProject,
     getProjectPeople,
     listProjectChats,
-    listTabularReviews,
     updateProject,
 } from "@/app/lib/mikeApi";
 import type {
@@ -26,9 +26,9 @@ import type {
     ColumnConfig,
     Folder as ProjectFolder,
     Project,
-    TabularReview,
 } from "@/app/components/shared/types";
 import { TableToolbar } from "@/app/components/shared/TableToolbar";
+import { TabPillButton } from "@/app/components/ui/tab-pill-button";
 import { NewTRModal } from "@/app/components/tabular/NewTRModal";
 import { ConfirmPopup } from "@/app/components/popups/ConfirmPopup";
 import { OwnerOnlyPopup } from "@/app/components/popups/OwnerOnlyPopup";
@@ -56,17 +56,18 @@ type ProjectWorkspaceValue = {
     setProjectChats: React.Dispatch<React.SetStateAction<Chat[] | null>>;
     projectChatsLoading: boolean;
     ensureProjectChats: () => Promise<Chat[]>;
-    projectReviews: TabularReview[] | null;
-    setProjectReviews: React.Dispatch<
-        React.SetStateAction<TabularReview[] | null>
-    >;
-    projectReviewsLoading: boolean;
-    ensureProjectReviews: () => Promise<TabularReview[]>;
     prefetchProjectSections: () => void;
     creatingChat: boolean;
     creatingReview: boolean;
     createChat: () => Promise<void>;
     openNewReview: () => void;
+    setDocumentUploadHeaderAction: (
+        kind: "savedFiles" | "uploadFiles" | "uploadFolder",
+        action: (() => void) | null,
+    ) => void;
+    setDocumentFolderBreadcrumbs: React.Dispatch<
+        React.SetStateAction<Array<{ label: string; onClick: () => void }>>
+    >;
     setOwnerOnlyAction: React.Dispatch<React.SetStateAction<string | null>>;
 };
 
@@ -97,6 +98,7 @@ function activeSectionFromSegments(
 
 function shouldShowWorkspaceShell(segments: string[]) {
     if (segments.length === 0) return true;
+    if (segments.length === 2 && segments[0] === "folders") return true;
     if (segments.length !== 1) return false;
     return segments[0] === "assistant" || segments[0] === "tabular-reviews";
 }
@@ -115,11 +117,7 @@ export function ProjectWorkspaceProvider({
         Record<ProjectWorkspaceSection, string>
     >({ documents: "", assistant: "", reviews: "" });
     const [projectChats, setProjectChats] = useState<Chat[] | null>(null);
-    const [projectReviews, setProjectReviews] = useState<
-        TabularReview[] | null
-    >(null);
     const [projectChatsLoading, setProjectChatsLoading] = useState(false);
-    const [projectReviewsLoading, setProjectReviewsLoading] = useState(false);
     const [peopleModalOpen, setPeopleModalOpen] = useState(false);
     const [projectDetailsOpen, setProjectDetailsOpen] = useState(false);
     const [ownerOnlyAction, setOwnerOnlyAction] = useState<string | null>(null);
@@ -131,7 +129,14 @@ export function ProjectWorkspaceProvider({
     const [newTRModalOpen, setNewTRModalOpen] = useState(false);
     const [creatingChat, setCreatingChat] = useState(false);
     const [creatingReview, setCreatingReview] = useState(false);
-
+    const [documentUploadActions, setDocumentUploadActions] = useState<{
+        savedFiles: (() => void) | null;
+        uploadFiles: (() => void) | null;
+        uploadFolder: (() => void) | null;
+    }>({ savedFiles: null, uploadFiles: null, uploadFolder: null });
+    const [documentFolderBreadcrumbs, setDocumentFolderBreadcrumbs] = useState<
+        Array<{ label: string; onClick: () => void }>
+    >([]);
     const segments = useSelectedLayoutSegments();
     const activeSection = activeSectionFromSegments(segments);
     const showShell = shouldShowWorkspaceShell(segments);
@@ -140,18 +145,30 @@ export function ProjectWorkspaceProvider({
     const { profile } = useUserProfile();
     const { saveChat } = useChatHistoryContext();
     const projectChatsPromiseRef = useRef<Promise<Chat[]> | null>(null);
-    const projectReviewsPromiseRef = useRef<Promise<TabularReview[]> | null>(
-        null,
-    );
 
     useEffect(() => {
         setProjectChats(null);
-        setProjectReviews(null);
         setProjectChatsLoading(false);
-        setProjectReviewsLoading(false);
+        setDocumentFolderBreadcrumbs([]);
         projectChatsPromiseRef.current = null;
-        projectReviewsPromiseRef.current = null;
     }, [projectId]);
+
+    const setDocumentUploadHeaderAction = useCallback(
+        (
+            kind: "savedFiles" | "uploadFiles" | "uploadFolder",
+            action: (() => void) | null,
+        ) => {
+            setDocumentUploadActions((current) => ({
+                ...current,
+                [kind]: action,
+            }));
+        },
+        [],
+    );
+
+    const openProjectRoot = useCallback(() => {
+        router.push(`/projects/${projectId}`);
+    }, [projectId, router]);
 
     useEffect(() => {
         if (!showShell) {
@@ -214,34 +231,9 @@ export function ProjectWorkspaceProvider({
         return promise;
     }, [projectChats, projectId]);
 
-    const ensureProjectReviews = useCallback(() => {
-        if (projectReviews) return Promise.resolve(projectReviews);
-        if (projectReviewsPromiseRef.current)
-            return projectReviewsPromiseRef.current;
-
-        setProjectReviewsLoading(true);
-        const promise = listTabularReviews(projectId)
-            .then((loaded) => {
-                setProjectReviews(loaded);
-                return loaded;
-            })
-            .catch((error) => {
-                console.error("[project reviews] failed to load", error);
-                setProjectReviews([]);
-                return [];
-            })
-            .finally(() => {
-                projectReviewsPromiseRef.current = null;
-                setProjectReviewsLoading(false);
-            });
-        projectReviewsPromiseRef.current = promise;
-        return promise;
-    }, [projectId, projectReviews]);
-
     const prefetchProjectSections = useCallback(() => {
         void ensureProjectChats();
-        void ensureProjectReviews();
-    }, [ensureProjectChats, ensureProjectReviews]);
+    }, [ensureProjectChats]);
 
     const createChat = useCallback(async () => {
         setCreatingChat(true);
@@ -273,17 +265,16 @@ export function ProjectWorkspaceProvider({
     }, [profile?.displayName, projectId, router, saveChat, user?.id]);
 
     const openNewReview = useCallback(() => {
-        const readyDocs =
-            project?.documents?.filter((d) => d.status === "ready") ?? [];
-        if (readyDocs.length === 0) return;
         setNewTRModalOpen(true);
-    }, [project?.documents]);
+    }, []);
 
     async function handleCreateReview(
         title: string,
-        _projectId?: string,
-        documentIds?: string[],
-        columnsConfig?: ColumnConfig[] | null,
+        _projectId: string | undefined,
+        documentIds: string[] | undefined,
+        columnsConfig: ColumnConfig[] | null | undefined,
+        documentGrouping: "document" | "folder" | undefined,
+        model: string,
     ) {
         setCreatingReview(true);
         try {
@@ -293,9 +284,10 @@ export function ProjectWorkspaceProvider({
                 title: title || undefined,
                 document_ids: documentIds ?? readyDocs.map((d) => d.id),
                 columns_config: columnsConfig ?? [],
+                document_grouping: documentGrouping,
+                model,
                 project_id: projectId,
             });
-            setProjectReviews((prev) => (prev ? [review, ...prev] : prev));
             router.push(`/projects/${projectId}/tabular-reviews/${review.id}`);
         } finally {
             setCreatingReview(false);
@@ -369,15 +361,13 @@ export function ProjectWorkspaceProvider({
             setProjectChats,
             projectChatsLoading,
             ensureProjectChats,
-            projectReviews,
-            setProjectReviews,
-            projectReviewsLoading,
-            ensureProjectReviews,
             prefetchProjectSections,
             creatingChat,
             creatingReview,
             createChat,
             openNewReview,
+            setDocumentUploadHeaderAction,
+            setDocumentFolderBreadcrumbs,
             setOwnerOnlyAction,
         }),
         [
@@ -391,14 +381,12 @@ export function ProjectWorkspaceProvider({
             projectChats,
             projectChatsLoading,
             ensureProjectChats,
-            projectReviews,
-            projectReviewsLoading,
-            ensureProjectReviews,
             prefetchProjectSections,
             creatingChat,
             creatingReview,
             createChat,
             openNewReview,
+            setDocumentUploadHeaderAction,
         ],
     );
 
@@ -416,17 +404,22 @@ export function ProjectWorkspaceProvider({
                 <ProjectPageHeader
                     project={project}
                     search={search}
+                    activeSection={activeSection}
                     creatingChat={creatingChat}
                     creatingReview={creatingReview}
-                    docsCount={project?.documents?.length ?? 0}
                     isOwner={project?.is_owner !== false}
                     onBackToProjects={() => router.push("/projects")}
+                    onProjectRoot={openProjectRoot}
                     onOpenDetails={() => setProjectDetailsOpen(true)}
                     onDeleteProject={requestProjectDelete}
                     onSearchChange={setSearch}
                     onOpenPeople={() => setPeopleModalOpen(true)}
                     onNewChat={() => void createChat()}
                     onNewReview={openNewReview}
+                    onSavedFiles={documentUploadActions.savedFiles}
+                    onUploadFiles={documentUploadActions.uploadFiles}
+                    onUploadFolder={documentUploadActions.uploadFolder}
+                    documentFolderBreadcrumbs={documentFolderBreadcrumbs}
                 />
 
                 {children}
@@ -435,9 +428,13 @@ export function ProjectWorkspaceProvider({
                     open={newTRModalOpen}
                     onClose={() => setNewTRModalOpen(false)}
                     onAdd={handleCreateReview}
-                    projectDocs={project?.documents?.filter(
-                        (d) => d.status === "ready",
-                    )}
+                    projectId={projectId}
+                    projectDocs={
+                        project?.documents?.filter(
+                            (d) => d.status === "ready",
+                        ) ?? []
+                    }
+                    projectFolders={folders}
                     projectName={project?.name}
                     projectCmNumber={project?.cm_number}
                 />
@@ -524,19 +521,25 @@ export function ProjectWorkspaceProvider({
 
 export function ProjectSectionToolbar({
     actions,
+    backAction,
 }: {
     actions?: ReactNode;
+    backAction?: (() => void) | null;
 }) {
     const { activeSection, projectId } = useProjectWorkspace();
     const router = useRouter();
 
     return (
         <TableToolbar
-            items={[
-                { id: "documents", label: "Documents" },
-                { id: "assistant", label: "Assistant Chats" },
-                { id: "reviews", label: "Tabular Reviews" },
-            ]}
+            items={
+                backAction
+                    ? []
+                    : [
+                          { id: "documents", label: "Documents" },
+                          { id: "assistant", label: "Chats" },
+                          { id: "reviews", label: "Tabular Reviews" },
+                      ]
+            }
             active={activeSection}
             onChange={(next) => {
                 const href =
@@ -547,6 +550,14 @@ export function ProjectSectionToolbar({
                           : `/projects/${projectId}/tabular-reviews`;
                 router.push(href);
             }}
+            leading={
+                backAction ? (
+                    <TabPillButton onClick={backAction}>
+                        <ChevronLeft className="h-3.5 w-3.5" />
+                        Back
+                    </TabPillButton>
+                ) : undefined
+            }
             actions={actions}
         />
     );

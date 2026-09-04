@@ -3,20 +3,22 @@
 import { useRef, useState } from "react";
 import { Upload, User, X } from "lucide-react";
 import {
+    UploadBatchError,
     addDocumentToProject,
     createProject,
-    uploadProjectDocument,
+    failedUploadMessage,
+    uploadProjectDocuments,
 } from "@/app/lib/mikeApi";
-import { useDirectoryData } from "../shared/useDirectoryData";
 import { FileDirectory } from "../shared/FileDirectory";
 import { AddUserInput } from "../shared/AddUserInput";
-import type { Project } from "../shared/types";
+import type { Document, Project } from "../shared/types";
 import type { UserLookupResult } from "@/app/lib/mikeApi";
 import { useAuth } from "@/app/contexts/AuthContext";
 import { Modal } from "../modals/Modal";
-import { ModalFieldLabel } from "../modals/ModalFieldLabel";
-import { ModalTextInput } from "../modals/ModalTextInput";
+import { FieldLabel, FormTextInput } from "../ui/form-field";
 import { ProjectPracticeField } from "./ProjectPracticeField";
+import { userFacingApiError } from "@/app/lib/userFacingError";
+import { LIQUID_GLASS_MODAL_ROW_HOVER_CLASS } from "@/shared/ui/LiquidGlassUI";
 
 interface Props {
     open: boolean;
@@ -30,24 +32,27 @@ export function NewProjectModal({ open, onClose, onCreated }: Props) {
     const [cmNumber, setCmNumber] = useState("");
     const [practice, setPractice] = useState("");
     const [sharedUsers, setSharedUsers] = useState<UserLookupResult[]>([]);
-    const [selectedDocIds, setSelectedDocIds] = useState<Set<string>>(new Set());
+    const [selectedDocuments, setSelectedDocuments] = useState<Document[]>([]);
     const [pendingFiles, setPendingFiles] = useState<File[]>([]);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState("");
+    // A project created with only some of its files attached. The modal holds
+    // it until the user has read which files are missing.
+    const [pendingProject, setPendingProject] = useState<Project | null>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
+    // The project is created before its documents are attached. Remember it so
+    // a retry after an attachment failure reuses the project the user already
+    // has instead of creating a second one.
+    const createdProjectRef = useRef<Project | null>(null);
     const { user } = useAuth();
     const ownEmail = user?.email?.trim().toLowerCase() ?? null;
     const formId = "new-project-modal-form";
-
-    const { loading: dirLoading, standaloneDocuments, projects: dirProjects } = useDirectoryData(open);
 
     if (!open) return null;
 
     function submitterValue(e: React.FormEvent<HTMLFormElement>) {
         return (
-            (e.nativeEvent as SubmitEvent).submitter as
-                | HTMLButtonElement
-                | null
+            (e.nativeEvent as SubmitEvent).submitter as HTMLButtonElement | null
         )?.value;
     }
 
@@ -55,12 +60,25 @@ export function NewProjectModal({ open, onClose, onCreated }: Props) {
         const files = Array.from(e.target.files ?? []);
         e.target.value = "";
         if (!files.length) return;
-        setPendingFiles((prev) => [...prev, ...files.filter((f) => !prev.some((p) => p.name === f.name))]);
+        setPendingFiles((prev) => [
+            ...prev,
+            ...files.filter((f) => !prev.some((p) => p.name === f.name)),
+        ]);
+    }
+
+    function finishCreation(project: Project) {
+        onCreated(project);
+        resetForm();
+        onClose();
     }
 
     async function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
         e.preventDefault();
         if (!name.trim()) return;
+        if (pendingProject) {
+            finishCreation(pendingProject);
+            return;
+        }
         if (step === "details" || submitterValue(e) !== "create-project") {
             setStep("documents");
             return;
@@ -68,44 +86,116 @@ export function NewProjectModal({ open, onClose, onCreated }: Props) {
         setLoading(true);
         setError("");
         try {
-            const project = await createProject(
-                name.trim(),
-                cmNumber.trim() || undefined,
-                practice.trim() && practice.trim() !== "Other"
-                    ? practice.trim()
-                    : undefined,
-                ownEmail
-                    ? sharedUsers
-                          .map((user) => user.email)
-                          .filter((email) => email !== ownEmail)
-                    : sharedUsers.map((user) => user.email),
+            const project =
+                createdProjectRef.current ??
+                (await createProject(
+                    name.trim(),
+                    cmNumber.trim() || undefined,
+                    practice.trim() && practice.trim() !== "Other"
+                        ? practice.trim()
+                        : undefined,
+                    ownEmail
+                        ? sharedUsers
+                              .map((user) => user.email)
+                              .filter((email) => email !== ownEmail)
+                        : sharedUsers.map((user) => user.email),
+                ));
+            createdProjectRef.current = project;
+
+            const linkResults = await Promise.all(
+                selectedDocuments.map((document) =>
+                    addDocumentToProject(project.id, document.id).then(
+                        () => true,
+                        () => false,
+                    ),
+                ),
             );
-            await Promise.all([
-                ...[...selectedDocIds].map((id) => addDocumentToProject(project.id, id).catch(() => {})),
-                ...pendingFiles.map((f) => uploadProjectDocument(project.id, f).catch(() => {})),
-            ]);
-            onCreated({ ...project, document_count: selectedDocIds.size + pendingFiles.length });
-            resetForm();
-            onClose();
+            const linkedCount = linkResults.filter(Boolean).length;
+            const failedLinkNames = selectedDocuments
+                .filter((_, index) => !linkResults[index])
+                .map((document) => document.filename);
+
+            let uploadedCount = 0;
+            let uploadFailure: string | null = null;
+            if (pendingFiles.length > 0) {
+                try {
+                    const outcomes = await uploadProjectDocuments(
+                        project.id,
+                        pendingFiles.map((file) => ({ file })),
+                    );
+                    uploadedCount = outcomes.filter(
+                        (outcome) => outcome.status === "completed",
+                    ).length;
+                    if (uploadedCount < outcomes.length) {
+                        uploadFailure = failedUploadMessage(outcomes);
+                    }
+                } catch (uploadError) {
+                    // Aborts, session-creation failures, and batch validation
+                    // still throw; everything else comes back as outcomes.
+                    uploadFailure =
+                        uploadError instanceof UploadBatchError
+                            ? failedUploadMessage(uploadError.outcomes)
+                            : userFacingApiError(
+                                  uploadError,
+                                  "The attached files could not be uploaded. Please try again.",
+                              );
+                }
+            }
+
+            const attachedCount = linkedCount + uploadedCount;
+            const requestedCount =
+                selectedDocuments.length + pendingFiles.length;
+            const failureMessage = [
+                uploadFailure,
+                failedLinkNames.length > 0
+                    ? `${failedLinkNames.join(", ")} could not be added to the project.`
+                    : null,
+            ]
+                .filter(Boolean)
+                .join(" ");
+
+            if (failureMessage) {
+                setError(failureMessage);
+                // Nothing the user attached made it in: stay put so the primary
+                // action retries the attachments against the same project,
+                // instead of closing on a project with no documents.
+                if (attachedCount === 0 && requestedCount > 0) return;
+                // Partial success: the project is real, so let the user read
+                // which files are missing before the modal hands it over.
+                setPendingProject({ ...project, document_count: attachedCount });
+                return;
+            }
+
+            finishCreation({ ...project, document_count: attachedCount });
         } catch (err: unknown) {
-            setError((err as Error).message || "Failed to create project");
+            setError(userFacingApiError(err, "Failed to create project"));
         } finally {
             setLoading(false);
         }
     }
 
     function resetForm() {
+        createdProjectRef.current = null;
+        setPendingProject(null);
         setStep("details");
         setName("");
         setCmNumber("");
         setPractice("");
         setSharedUsers([]);
-        setSelectedDocIds(new Set());
+        setSelectedDocuments([]);
         setPendingFiles([]);
         setError("");
     }
 
     function handleClose() {
+        // The project is created before its documents are attached, so a close
+        // after an attachment failure must still hand the project over. Losing
+        // it here would leave a real project missing from the list.
+        const created = pendingProject ?? createdProjectRef.current;
+        if (created) {
+            finishCreation({ ...created, document_count: created.document_count ?? 0 });
+            return;
+        }
         resetForm();
         onClose();
     }
@@ -184,7 +274,11 @@ export function NewProjectModal({ open, onClose, onCreated }: Props) {
                           disabled: !name.trim() || loading,
                       }
                     : {
-                          label: loading ? "Creating…" : "Create project",
+                          label: loading
+                              ? "Creating…"
+                              : pendingProject
+                                ? "Continue"
+                                : "Create project",
                           type: "submit",
                           form: formId,
                           name: "modalAction",
@@ -208,10 +302,10 @@ export function NewProjectModal({ open, onClose, onCreated }: Props) {
                 {step === "details" ? (
                     <div className="space-y-6">
                         <div>
-                            <ModalFieldLabel htmlFor="new-project-name">
+                            <FieldLabel htmlFor="new-project-name">
                                 Project name
-                            </ModalFieldLabel>
-                            <ModalTextInput
+                            </FieldLabel>
+                            <FormTextInput
                                 id="new-project-name"
                                 type="text"
                                 value={name}
@@ -223,10 +317,10 @@ export function NewProjectModal({ open, onClose, onCreated }: Props) {
                         </div>
 
                         <div>
-                            <ModalFieldLabel htmlFor="new-project-cm-number">
+                            <FieldLabel htmlFor="new-project-cm-number">
                                 CM number
-                            </ModalFieldLabel>
-                            <ModalTextInput
+                            </FieldLabel>
+                            <FormTextInput
                                 id="new-project-cm-number"
                                 type="text"
                                 value={cmNumber}
@@ -238,9 +332,9 @@ export function NewProjectModal({ open, onClose, onCreated }: Props) {
                         </div>
 
                         <div>
-                            <ModalFieldLabel htmlFor="new-project-practice">
+                            <FieldLabel htmlFor="new-project-practice">
                                 Practice
-                            </ModalFieldLabel>
+                            </FieldLabel>
                             <ProjectPracticeField
                                 id="new-project-practice"
                                 value={practice}
@@ -249,9 +343,7 @@ export function NewProjectModal({ open, onClose, onCreated }: Props) {
                         </div>
 
                         <div className="space-y-2">
-                            <ModalFieldLabel as="p">
-                                Share with
-                            </ModalFieldLabel>
+                            <FieldLabel as="p">Share with</FieldLabel>
                             <AddUserInput
                                 onAdd={handleAddShareUser}
                                 validateEmail={validateShareUser}
@@ -269,7 +361,7 @@ export function NewProjectModal({ open, onClose, onCreated }: Props) {
                                         return (
                                             <li
                                                 key={entry.email}
-                                                className="flex items-center gap-2.5 rounded-lg px-2 py-1.5 transition-colors hover:bg-gray-100/70"
+                                                className={`${LIQUID_GLASS_MODAL_ROW_HOVER_CLASS} flex items-center gap-2.5 rounded-lg px-2 py-1.5 transition-colors`}
                                             >
                                                 <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-white/80 bg-white text-gray-700 shadow-[0_4px_12px_rgba(15,23,42,0.10),inset_0_1px_0_rgba(255,255,255,0.92),inset_0_-1px_0_rgba(255,255,255,0.64)]">
                                                     {initial ? (
@@ -311,22 +403,14 @@ export function NewProjectModal({ open, onClose, onCreated }: Props) {
                 ) : (
                     <div className="flex min-h-0 flex-1 flex-col">
                         <FileDirectory
-                            standaloneDocs={standaloneDocuments}
-                            directoryProjects={dirProjects}
-                            loading={dirLoading}
-                            selectedIds={selectedDocIds}
-                            onChange={setSelectedDocIds}
-                            emptyMessage="No existing documents"
-                            searchable
-                            searchAutoFocus
-                            showProjectTabs
+                            selectedDocuments={selectedDocuments}
+                            onChange={setSelectedDocuments}
+                            showTabs
                         />
                     </div>
                 )}
 
-                {error && (
-                    <p className="mt-3 text-sm text-red-500">{error}</p>
-                )}
+                {error && <p className="mt-3 text-sm text-red-500">{error}</p>}
             </form>
         </Modal>
     );

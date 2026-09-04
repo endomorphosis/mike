@@ -1,16 +1,14 @@
 import {
   streamChatWithTools,
   resolveModel,
-  DEFAULT_MAIN_MODEL,
   type LlmMessage,
   type OpenAIToolSchema,
 } from "../llm";
-import { safeErrorMessage } from "../safeError";
+import { resolveRequestedModel } from "../routerModels";
+import { UserFacingError } from "../userFacingError";
 import { createServerSupabase } from "../supabase";
-import {
-  buildUserMcpTools,
-  type McpToolEvent,
-} from "../mcpConnectors";
+import { buildUserMcpTools, type McpToolEvent } from "../mcpConnectors";
+import type { SourceDocument } from "../sourceDocuments";
 import {
   COURTLISTENER_TOOLS,
   type CaseCitationEvent,
@@ -22,9 +20,11 @@ import {
   type TabularCellStore,
   type WorkflowStore,
   type ToolCall,
+  type AskInputResponseItem,
   type AskInputsEvent,
   type EditAnnotation,
   devLog,
+  resolveDocLabel,
 } from "./types";
 import { TOOLS, WORKFLOW_TOOLS } from "./tools/toolSchemas";
 import {
@@ -33,34 +33,38 @@ import {
   createCitation,
   CITATIONS_OPEN_TAG,
 } from "./citations";
+import { runToolCalls } from "./tools/toolDispatcher";
 import {
-  runToolCalls,
+  getCachedCaseOpinionTexts,
   type CourtlistenerTurnState,
-} from "./tools/toolDispatcher";
+} from "./tools/courtlistenerTurnState";
 import {
+  readDocumentContent,
   type TurnEditState,
   type TurnReadState,
 } from "./tools/documentOps";
-
+import { verifyCitations } from "./verifyCitations";
 
 export type AssistantEvent =
   | { type: "reasoning"; text: string }
   | AskInputsEvent
   | {
       type: "ask_inputs_response";
-      responses: {
-        id: string;
-        kind: "choice" | "documents";
-        question?: string;
-        answer?: string;
-        filenames?: string[];
-        skipped?: boolean;
-      }[];
+      responses: AskInputResponseItem[];
     }
-  | { type: "doc_read"; filename: string; document_id?: string }
+  | {
+      type: "doc_read";
+      filename: string;
+      document_id?: string;
+      version_id?: string | null;
+      version_number?: number | null;
+    }
   | {
       type: "doc_find";
       filename: string;
+      document_id?: string;
+      version_id?: string | null;
+      version_number?: number | null;
       query: string;
       total_matches: number;
     }
@@ -98,9 +102,44 @@ export type AssistantEvent =
   | CaseCitationEvent
   | CourtlistenerToolEvent
   | McpToolEvent
-  | { type: "case_opinions"; cluster_id: number; case: unknown }
+  | {
+      type: "case_opinions";
+      cluster_id: number;
+      document: SourceDocument;
+    }
   | { type: "content"; text: string }
-  | { type: "error"; message: string };
+  | {
+      /**
+       * Placement marker for one edit a client tool proposed, spliced into
+       * the event stream exactly where the tool call landed between content
+       * blocks. `persistWordDocumentEdits` upserts it into the canonical
+       * `word_document_edits` row and swaps it for a `word_edit_ref` — the
+       * same normalization the `<EDITS>` protocol's blocks go through, so
+       * both channels produce identical persisted history.
+       */
+      type: "word_edit_block";
+      block_index: number;
+      original_text: string;
+      replacement_text: string;
+      formats: string[];
+      occurrence: "all" | null;
+      reason: string | null;
+    }
+  | { type: "error"; message: string; safe_to_display?: boolean };
+
+/**
+ * Tools the model can call that execute outside this process — in the Word
+ * task pane. The adapter owns forwarding the call to the client and awaiting
+ * its posted result; the loop treats the returned content exactly like a
+ * server-side tool result.
+ */
+export interface ClientToolsAdapter {
+  schemas: OpenAIToolSchema[];
+  owns: (name: string) => boolean;
+  execute: (
+    call: import("../llm").NormalizedToolCall,
+  ) => Promise<{ content: string; events: AssistantEvent[] }>;
+}
 
 export class AssistantStreamError extends Error {
   fullText: string;
@@ -111,6 +150,38 @@ export class AssistantStreamError extends Error {
     this.name = "AssistantStreamError";
     this.fullText = fullText;
     this.events = events;
+  }
+}
+
+export const ASSISTANT_ERROR_MESSAGE =
+  "The response could not be completed. Please try again.";
+const TOOL_ERROR_MESSAGE = "This tool could not complete its request.";
+
+function sanitizeAssistantEvent(event: AssistantEvent): AssistantEvent {
+  if (event.type === "error") {
+    return event.safe_to_display
+      ? event
+      : { ...event, message: ASSISTANT_ERROR_MESSAGE };
+  }
+  if ("error" in event && typeof event.error === "string" && event.error) {
+    return { ...event, error: TOOL_ERROR_MESSAGE };
+  }
+  return event;
+}
+
+export function sanitizeAssistantSseChunk(chunk: string): string {
+  if (!chunk.startsWith("data: ")) return chunk;
+  const payload = chunk.slice(6).trim();
+  if (!payload || payload === "[DONE]") return chunk;
+  try {
+    const parsed = JSON.parse(payload) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return chunk;
+    }
+    const sanitized = sanitizeAssistantEvent(parsed as AssistantEvent);
+    return `data: ${JSON.stringify(sanitized)}\n\n`;
+  } catch {
+    return chunk;
   }
 }
 
@@ -131,9 +202,7 @@ class AssistantStreamAskInputsPause extends Error {
 export function isAbortError(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;
   const record = error as { name?: unknown; message?: unknown };
-  return (
-    record.name === "AbortError" || record.message === "Stream aborted."
-  );
+  return record.name === "AbortError" || record.message === "Stream aborted.";
 }
 
 function throwIfAborted(signal?: AbortSignal) {
@@ -152,18 +221,36 @@ export async function runLLMStream(params: {
   write: (s: string) => void;
   extraTools?: unknown[];
   includeResearchTools?: boolean;
+  /** Expose ask_inputs only to clients that can render and answer it. */
+  includeAskInputs?: boolean;
   workflowStore?: WorkflowStore;
   tabularStore?: TabularCellStore;
+  /** Tools executed by the connected client (Word add-in) instead of here. */
+  clientTools?: ClientToolsAdapter;
+  /**
+   * Tool-loop iteration budget (default 10). Surfaces whose tools are built
+   * around retry round-trips (Word client edits: propose → fail → re-read →
+   * retry) need headroom, or the loop ends before the model's summary.
+   */
+  maxIterations?: number;
   buildCitations?: (fullText: string) => unknown[];
   model?: string;
+  /** AI SDK reasoning effort for this interactive request. */
+  reasoning?: import("../llm").ReasoningLevel;
   apiKeys?: import("../llm").UserApiKeys;
   signal?: AbortSignal;
+  /** Let a route persist the completed turn before it signals stream success. */
+  emitDone?: boolean;
   /**
    * If set, generate_docx will attach created docs to this project so
    * they appear in the project sidebar. Leave null for general chats —
    * generated docs still get persisted, but as standalone documents.
    */
   projectId?: string | null;
+  /** Per-request spotlighting nonce — generated by the caller and passed
+   *  here so that the same nonce fences both the system-prompt filenames
+   *  (added by buildMessages) and the document bodies returned by tools. */
+  nonce?: string;
 }): Promise<{
   fullText: string;
   events: AssistantEvent[];
@@ -175,23 +262,34 @@ export async function runLLMStream(params: {
     docIndex,
     userId,
     db,
-    write,
+    write: unsafeWrite,
     extraTools,
     includeResearchTools = true,
+    includeAskInputs = true,
     workflowStore,
     tabularStore,
+    clientTools,
     buildCitations,
     model,
     apiKeys,
     signal,
     projectId,
+    nonce,
   } = params;
+  const write = (chunk: string) =>
+    unsafeWrite(sanitizeAssistantSseChunk(chunk));
   const researchTools = includeResearchTools ? COURTLISTENER_TOOLS : [];
   const mcpTools = await buildUserMcpTools(userId, db);
-  const baseTools = [...TOOLS, ...researchTools, ...WORKFLOW_TOOLS];
-  const activeTools = extraTools?.length
-    ? [...baseTools, ...mcpTools, ...extraTools]
-    : [...baseTools, ...mcpTools];
+  const conversationTools = includeAskInputs
+    ? TOOLS
+    : TOOLS.filter((tool) => tool.function.name !== "ask_inputs");
+  const baseTools = [...conversationTools, ...researchTools, ...WORKFLOW_TOOLS];
+  const activeTools = [
+    ...baseTools,
+    ...mcpTools,
+    ...(extraTools ?? []),
+    ...(clientTools?.schemas ?? []),
+  ];
 
   // Extract system prompt; pass remaining turns to the adapter as
   // plain user/assistant messages.
@@ -217,8 +315,8 @@ export async function runLLMStream(params: {
   // changes that document so a post-edit verification read can still happen.
   const turnReadState: TurnReadState = new Map();
   const courtlistenerTurnState: CourtlistenerTurnState = {
-      casesByClusterId: new Map(),
-    };
+    casesByClusterId: new Map(),
+  };
   let fullText = "";
   let iterText = "";
   let iterVisibleText = "";
@@ -233,7 +331,9 @@ export async function runLLMStream(params: {
     citations: unknown[],
   ) => {
     if (buildCitations) return;
-    write(`data: ${JSON.stringify({ type: "citations", status, citations })}\n\n`);
+    write(
+      `data: ${JSON.stringify({ type: "citations", status, citations })}\n\n`,
+    );
   };
 
   const streamHiddenCitationContent = (delta: string) => {
@@ -247,6 +347,7 @@ export async function runLLMStream(params: {
         c,
         docIndex,
         courtlistenerTurnState.casesByClusterId,
+        docStore,
       ),
     );
     emitCitationStreamSnapshot("partial", citations);
@@ -329,18 +430,44 @@ export async function runLLMStream(params: {
     }
   };
 
-  const selectedModel = resolveModel(model, DEFAULT_MAIN_MODEL);
-
   try {
     throwIfAborted(signal);
+    // Single request-time choke point for every runLLMStream caller (chat,
+    // project chat, Word chat, tabular): router-prefixed models must be in the
+    // user's saved selection.
+    //
+    // This lives INSIDE the try because it touches the database. Above it, a
+    // read failure escaped as a bare rejection — before any error event was
+    // pushed and before AssistantStreamError could carry the partial turn — so
+    // the SSE client saw the socket end with no explanation. Inside, a blip
+    // takes the same path as any other mid-stream failure.
+    //
+    // "throw" (not silent fallback) because `model` here is what the caller
+    // asked for in THIS request. Stored task models are validated by their
+    // route before they arrive here, but this guard keeps every caller safe.
+    const requestedModel = resolveModel(model, "");
+    if (!requestedModel) {
+      throw new UserFacingError(
+        model
+          ? `Model "${model}" is not available. Select another model.`
+          : "Select a model before sending a message.",
+      );
+    }
+    const selectedModel = await resolveRequestedModel(
+      requestedModel,
+      "",
+      userId,
+      db,
+      "throw",
+    );
     await streamChatWithTools({
       model: selectedModel,
       systemPrompt,
       messages: chatMessages,
       tools: activeTools as OpenAIToolSchema[],
-      maxIterations: 10,
+      maxIterations: params.maxIterations ?? 10,
       apiKeys,
-      enableThinking: true,
+      reasoning: params.reasoning ?? "high",
       abortSignal: signal,
       callbacks: {
         onContentDelta: (delta) => {
@@ -381,7 +508,26 @@ export async function runLLMStream(params: {
         // UI sees it before the tool results stream in.
         flushText();
 
-        const toolCalls: ToolCall[] = calls.map((c) => ({
+        // Client-executed tools (Word add-in) round-trip through the SSE
+        // stream and never enter the server dispatcher. They run before the
+        // server batch and sequentially among themselves: each call mutates
+        // or reads the live document, so order is part of their semantics.
+        const clientResultByCallId = new Map<string, string>();
+        const serverCalls = clientTools
+          ? calls.filter((c) => !clientTools.owns(c.name))
+          : calls;
+        if (clientTools) {
+          for (const call of calls) {
+            if (!clientTools.owns(call.name)) continue;
+            const { content, events: clientEvents } =
+              await clientTools.execute(call);
+            clientResultByCallId.set(call.id, content);
+            events.push(...clientEvents);
+            throwIfAborted(signal);
+          }
+        }
+
+        const toolCalls: ToolCall[] = serverCalls.map((c) => ({
           id: c.id,
           function: {
             name: c.name,
@@ -414,6 +560,7 @@ export async function runLLMStream(params: {
           projectId,
           courtlistenerTurnState,
           apiKeys,
+          nonce,
         );
         throwIfAborted(signal);
         for (const r of docsRead) {
@@ -421,12 +568,17 @@ export async function runLLMStream(params: {
             type: "doc_read",
             filename: r.filename,
             document_id: r.document_id,
+            version_id: r.version_id,
+            version_number: r.version_number,
           });
         }
         for (const f of docsFound) {
           events.push({
             type: "doc_find",
             filename: f.filename,
+            document_id: f.document_id,
+            version_id: f.version_id,
+            version_number: f.version_number,
             query: f.query,
             total_matches: f.total_matches,
           });
@@ -491,17 +643,22 @@ export async function runLLMStream(params: {
         // that directly — and fall back to an error result for any
         // tool_use that didn't produce one, so Claude's next request
         // has a tool_result for every tool_use it sent.
-        const resultByCallId = new Map<string, string>();
+        const resultByCallId = new Map<string, string>(clientResultByCallId);
         for (const r of toolResults) {
-          const row = r as { tool_call_id: string; content?: unknown };
+          const row = r as {
+            tool_call_id: string;
+            content?: unknown;
+          };
           resultByCallId.set(row.tool_call_id, String(row.content ?? ""));
         }
-        return toolCalls.map((c) => ({
+        // Answer every tool_use the model sent — client and server alike —
+        // in the model's original call order.
+        return calls.map((c) => ({
           tool_use_id: c.id,
           content:
             resultByCallId.get(c.id) ??
             JSON.stringify({
-              error: `Tool '${c.function.name}' is not available.`,
+              error: `Tool '${c.name}' is not available.`,
             }),
         }));
       },
@@ -513,12 +670,25 @@ export async function runLLMStream(params: {
       // prose telling the user to answer the picker or attach documents.
     } else if (isAbortError(err)) {
       flushPartialTurn({ emit: false });
-      throw new AssistantStreamAbortError(fullText, events);
+      throw new AssistantStreamAbortError(
+        fullText,
+        events.map(sanitizeAssistantEvent),
+      );
     } else {
       flushPartialTurn();
-      const message = safeErrorMessage(err, "Stream error");
-      events.push({ type: "error", message });
-      throw new AssistantStreamError(message, fullText, events);
+      console.error("[chat/stream] model stream failed", err);
+      const safeToDisplay = err instanceof UserFacingError;
+      const message = safeToDisplay ? err.message : ASSISTANT_ERROR_MESSAGE;
+      events.push({
+        type: "error",
+        message,
+        ...(safeToDisplay ? { safe_to_display: true } : {}),
+      });
+      throw new AssistantStreamError(
+        message,
+        fullText,
+        events.map(sanitizeAssistantEvent),
+      );
     }
   }
 
@@ -527,15 +697,44 @@ export async function runLLMStream(params: {
   // Parse and emit citations from <CITATIONS> block
   const { citations: parsedCitations, diagnostics: citationDiagnostics } =
     parseCitationsWithDiagnostics(fullText);
-  const citations = buildCitations
-    ? buildCitations(fullText)
-    : parsedCitations.map((c) =>
-        createCitation(
-          c,
-          docIndex,
-          courtlistenerTurnState.casesByClusterId,
-        ),
-      );
+  let citations: unknown[];
+  if (buildCitations) {
+    // Custom builders (tabular) bypass document-citation verification.
+    citations = buildCitations(fullText);
+  } else {
+    const rawCitations = parsedCitations.map((c) =>
+      createCitation(
+        c,
+        docIndex,
+        courtlistenerTurnState.casesByClusterId,
+        docStore,
+      ),
+    );
+    // Server-side quote verification. Fetch each document's extracted source
+    // text at most once per turn (memoized by doc_id), reading only bytes
+    // already in storage with emitEvents:false. Case citations are matched
+    // against the opinion text cached during this turn.
+    const sourceTextByDocId = new Map<string, Promise<string>>();
+    const getSourceText = (docId: string): Promise<string> => {
+      let pending = sourceTextByDocId.get(docId);
+      if (!pending) {
+        const label = resolveDocLabel(docId, docStore, docIndex);
+        pending = label
+          ? readDocumentContent(label, docStore, () => {}, docIndex, db, {
+              emitEvents: false,
+            })
+          : Promise.resolve("");
+        sourceTextByDocId.set(docId, pending);
+      }
+      return pending;
+    };
+    citations = await verifyCitations(
+      rawCitations,
+      getSourceText,
+      async (clusterId) =>
+        getCachedCaseOpinionTexts(courtlistenerTurnState, clusterId),
+    );
+  }
   devLog("[chat/stream] final citations", {
     hasCitationsBlock: citationDiagnostics.hasBlock,
     citationsBlockLength: citationDiagnostics.rawLength,
@@ -547,7 +746,13 @@ export async function runLLMStream(params: {
   write(
     `data: ${JSON.stringify({ type: "citations", status: "final", citations })}\n\n`,
   );
-  write("data: [DONE]\n\n");
+  if (params.emitDone !== false) {
+    write("data: [DONE]\n\n");
+  }
 
-  return { fullText, events, citations };
+  return {
+    fullText,
+    events: events.map(sanitizeAssistantEvent),
+    citations,
+  };
 }

@@ -1,31 +1,45 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import {
+    forwardRef,
+    useEffect,
+    useRef,
+    useState,
+    type ComponentPropsWithoutRef,
+} from "react";
+import { createPortal } from "react-dom";
 import {
     Download,
     Eye,
     EyeOff,
     FolderMinus,
-    FolderPlus,
     Hash,
     History,
     Pencil,
     Trash2,
     Upload,
+    X,
 } from "lucide-react";
+import { SubfolderSvgIcon } from "@/app/components/shared/FolderSvgIcon";
 import {
-    GLASS_DROPDOWN,
-    GLASS_MENU_ITEM,
-} from "@/app/components/shared/HeaderFilterDropdown";
+    CLOSE_ROW_ACTIONS_EVENT,
+    closeRowActionMenus,
+} from "@/app/components/shared/TablePrimitive";
+import {
+    LiquidDropdownButton,
+    LiquidDropdownSurface,
+} from "@/app/components/ui/liquid-dropdown";
+import { cn } from "@/app/lib/utils";
+import { LIQUID_GLASS_HOVER_CLASS } from "@/app/components/ui/liquid-surface";
 
-export const CLOSE_ROW_ACTIONS_EVENT = "mike:close-row-actions";
+export { CLOSE_ROW_ACTIONS_EVENT, closeRowActionMenus };
 
-export function closeRowActionMenus() {
-    document.dispatchEvent(new Event(CLOSE_ROW_ACTIONS_EVENT));
-}
+export type RowActionMenuSurfaceProps = ComponentPropsWithoutRef<"div">;
 
 interface Props {
-    onDelete?: () => void;
+    onDeselect?: () => void;
+    onView?: () => void;
+    onDelete?: () => void | Promise<void>;
     onHide?: () => void;
     onUnhide?: () => void;
     onDownload?: () => void;
@@ -38,12 +52,28 @@ interface Props {
     onEditDetails?: () => void;
     onRename?: () => void;
     onUpdateCmNumber?: () => void;
+    viewLabel?: string;
+    editDetailsLabel?: string;
     newSubfolderLabel?: string;
     renameLabel?: string;
+    uploadNewVersionLabel?: string;
     deleteLabel?: string;
 }
+type RowActionMenuItemsProps = Props & {
+    onClose: () => void;
+    surfaceProps?: RowActionMenuSurfaceProps;
+};
 
-export function RowActionMenuItems({
+const ROW_ACTION_ITEM_CLASS =
+    "flex items-center gap-2 w-full px-3 py-2 text-gray-600";
+const ROW_ACTION_LEFT_ITEM_CLASS = `text-left ${ROW_ACTION_ITEM_CLASS}`;
+
+export const RowActionMenuItems = forwardRef<
+    HTMLDivElement,
+    RowActionMenuItemsProps
+>(function RowActionMenuItems({
+    onDeselect,
+    onView,
     onDelete,
     onHide,
     onUnhide,
@@ -57,109 +87,144 @@ export function RowActionMenuItems({
     onEditDetails,
     onRename,
     onUpdateCmNumber,
+    viewLabel = "View",
+    editDetailsLabel = "Edit details",
     newSubfolderLabel = "New subfolder",
     renameLabel = "Rename",
+    uploadNewVersionLabel = "Upload new version",
     deleteLabel = "Delete",
     onClose,
-}: Props & { onClose: () => void }) {
+    surfaceProps,
+}, ref) {
+    const { className: surfaceClassName, ...restSurfaceProps } =
+        surfaceProps ?? {};
+
     return (
-        <>
-            {onNewSubfolder && (
-                <button
-                    onClick={() => { onClose(); onNewSubfolder(); }}
-                    className={`flex items-center gap-2 w-full px-3 py-2 text-xs text-left text-gray-600 ${GLASS_MENU_ITEM}`}
+        <LiquidDropdownSurface
+            ref={ref}
+            className={cn("w-48 overflow-hidden", surfaceClassName)}
+            {...restSurfaceProps}
+        >
+            {onDeselect && (
+                <LiquidDropdownButton
+                    onClick={() => { onClose(); onDeselect(); }}
+                    className={ROW_ACTION_LEFT_ITEM_CLASS}
                 >
-                    <FolderPlus className="h-3.5 w-3.5 shrink-0" />
+                    <X className="h-3.5 w-3.5 shrink-0" />
+                    Deselect rows
+                </LiquidDropdownButton>
+            )}
+            {onView && (
+                <LiquidDropdownButton
+                    onClick={() => { onClose(); onView(); }}
+                    className={ROW_ACTION_ITEM_CLASS}
+                >
+                    <Eye className="h-3.5 w-3.5" />
+                    {viewLabel}
+                </LiquidDropdownButton>
+            )}
+            {onNewSubfolder && (
+                <LiquidDropdownButton
+                    onClick={() => { onClose(); onNewSubfolder(); }}
+                    className={ROW_ACTION_LEFT_ITEM_CLASS}
+                >
+                    <SubfolderSvgIcon className="h-3.5 w-3.5 shrink-0" />
                     {newSubfolderLabel}
-                </button>
+                </LiquidDropdownButton>
             )}
             {onRename && (
-                <button
+                <LiquidDropdownButton
                     onClick={() => { onClose(); onRename(); }}
-                    className={`flex items-center gap-2 w-full px-3 py-2 text-xs text-gray-600 ${GLASS_MENU_ITEM}`}
+                    className={ROW_ACTION_ITEM_CLASS}
                 >
                     <Pencil className="h-3.5 w-3.5" />
                     {renameLabel}
-                </button>
+                </LiquidDropdownButton>
             )}
             {onEditDetails && (
-                <button
+                <LiquidDropdownButton
                     onClick={() => { onClose(); onEditDetails(); }}
-                    className={`flex items-center gap-2 w-full px-3 py-2 text-xs text-gray-600 ${GLASS_MENU_ITEM}`}
+                    className={ROW_ACTION_ITEM_CLASS}
                 >
                     <Pencil className="h-3.5 w-3.5" />
-                    Edit details
-                </button>
+                    {editDetailsLabel}
+                </LiquidDropdownButton>
             )}
             {onUpdateCmNumber && (
-                <button
+                <LiquidDropdownButton
                     onClick={() => { onClose(); onUpdateCmNumber(); }}
-                    className={`flex items-center gap-2 w-full px-3 py-2 text-xs text-gray-600 ${GLASS_MENU_ITEM}`}
+                    className={ROW_ACTION_ITEM_CLASS}
                 >
                     <Hash className="h-3.5 w-3.5" />
                     Edit CM No.
-                </button>
+                </LiquidDropdownButton>
             )}
             {onDownload && (
-                <button
+                <LiquidDropdownButton
                     onClick={() => { onClose(); onDownload(); }}
-                    className={`flex items-center gap-2 w-full px-3 py-2 text-xs text-gray-600 ${GLASS_MENU_ITEM}`}
+                    className={ROW_ACTION_ITEM_CLASS}
                 >
                     <Download className="h-3.5 w-3.5" />
                     Download
-                </button>
+                </LiquidDropdownButton>
             )}
             {onShowAllVersions && (
-                <button
+                <LiquidDropdownButton
                     onClick={() => { onClose(); onShowAllVersions(); }}
-                    className={`flex items-center gap-2 w-full px-3 py-2 text-xs text-left text-gray-600 ${GLASS_MENU_ITEM}`}
+                    className={ROW_ACTION_LEFT_ITEM_CLASS}
                 >
                     <History className="h-3.5 w-3.5 shrink-0" />
                     Show all versions
-                </button>
+                </LiquidDropdownButton>
             )}
             {onUploadNewVersion && (
-                <button
+                <LiquidDropdownButton
                     onClick={() => { onClose(); onUploadNewVersion(); }}
-                    className={`flex items-center gap-2 w-full px-3 py-2 text-xs text-left text-gray-600 ${GLASS_MENU_ITEM}`}
+                    className={ROW_ACTION_LEFT_ITEM_CLASS}
                 >
                     <Upload className="h-3.5 w-3.5 shrink-0" />
-                    Upload new version
-                </button>
+                    {uploadNewVersionLabel}
+                </LiquidDropdownButton>
             )}
             {onRemoveFromFolder && (
-                <button
+                <LiquidDropdownButton
                     onClick={() => { onClose(); onRemoveFromFolder(); }}
-                    className={`flex items-center gap-2 w-full px-3 py-2 text-xs text-left text-gray-600 ${GLASS_MENU_ITEM}`}
+                    className={ROW_ACTION_LEFT_ITEM_CLASS}
                 >
                     <FolderMinus className="h-3.5 w-3.5 shrink-0" />
                     Remove from subfolder
-                </button>
+                </LiquidDropdownButton>
             )}
             {onUnhide && (
-                <button
+                <LiquidDropdownButton
                     onClick={() => { onClose(); onUnhide(); }}
-                    className={`flex items-center gap-2 w-full px-3 py-2 text-xs text-gray-600 ${GLASS_MENU_ITEM}`}
+                    className={ROW_ACTION_ITEM_CLASS}
                 >
                     <Eye className="h-3.5 w-3.5" />
                     Activate
-                </button>
+                </LiquidDropdownButton>
             )}
             {onHide && (
-                <button
+                <LiquidDropdownButton
                     onClick={() => { onClose(); onHide(); }}
-                    className={`flex items-center gap-2 w-full px-3 py-2 text-xs text-gray-600 ${GLASS_MENU_ITEM}`}
+                    className={ROW_ACTION_ITEM_CLASS}
                 >
                     <EyeOff className="h-3.5 w-3.5" />
                     Deactivate
-                </button>
+                </LiquidDropdownButton>
             )}
             {onDelete && (
                 <button
                     onClick={() => {
                         if (deleteDisabled || deleting) return;
                         onClose();
-                        onDelete();
+                        // The menu closes immediately, so an async handler that
+                        // rejects has nothing left to report to. Swallow it here
+                        // rather than leaving an unhandled rejection; surfaces
+                        // that can explain the failure do so themselves.
+                        void Promise.resolve(onDelete()).catch((error) => {
+                            console.error("row delete action failed", error);
+                        });
                     }}
                     disabled={deleting || deleteDisabled}
                     className={`flex items-center gap-2 w-full px-3 py-2 text-xs text-red-500 transition-colors disabled:opacity-40 ${
@@ -172,9 +237,9 @@ export function RowActionMenuItems({
                     {deleteLabel}
                 </button>
             )}
-        </>
+        </LiquidDropdownSurface>
     );
-}
+});
 
 export function RowActions(props: Props) {
     const [open, setOpen] = useState(false);
@@ -223,24 +288,31 @@ export function RowActions(props: Props) {
         <>
             <button
                 ref={btnRef}
+                type="button"
+                aria-label="Open row actions"
                 onClick={handleToggle}
-                className="flex items-center justify-center w-6 h-6 rounded text-gray-700 hover:text-gray-900 hover:bg-gray-100 transition-colors leading-none"
+                className={`flex items-center justify-center w-6 h-6 rounded text-gray-700 hover:text-gray-900 transition-colors leading-none ${LIQUID_GLASS_HOVER_CLASS}`}
             >
                 <span className="tracking-widest text-xs">···</span>
             </button>
 
-            {open && (
-                <div
-                    style={{ position: "fixed", top: coords.top, right: coords.right }}
-                    className={`z-[120] w-48 overflow-hidden ${GLASS_DROPDOWN}`}
-                    onClick={(e) => e.stopPropagation()}
-                >
+            {open &&
+                createPortal(
                     <RowActionMenuItems
                         {...props}
                         onClose={() => setOpen(false)}
-                    />
-                </div>
-            )}
+                        surfaceProps={{
+                            style: {
+                                position: "fixed",
+                                top: coords.top,
+                                right: coords.right,
+                            },
+                            className: "z-[120]",
+                            onClick: (e) => e.stopPropagation(),
+                        }}
+                    />,
+                    document.body,
+                )}
         </>
     );
 }

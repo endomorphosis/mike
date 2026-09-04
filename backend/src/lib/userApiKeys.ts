@@ -8,6 +8,8 @@ export type ApiKeyProvider =
     | "gemini"
     | "openai"
     | "openrouter"
+    | "vercel"
+    | "opencode-go"
     | "courtlistener";
 export type ApiKeySource = "user" | "env" | null;
 export type ApiKeyStatus = Record<ApiKeyProvider, boolean> & {
@@ -26,6 +28,8 @@ const PROVIDERS: ApiKeyProvider[] = [
     "gemini",
     "openai",
     "openrouter",
+    "vercel",
+    "opencode-go",
     "courtlistener",
 ];
 
@@ -43,6 +47,14 @@ function envApiKey(provider: ApiKeyProvider): string | null {
             return process.env.OPENAI_API_KEY?.trim() || null;
         case "openrouter":
             return process.env.OPENROUTER_API_KEY?.trim() || null;
+        case "vercel":
+            return (
+                process.env.AI_GATEWAY_API_KEY?.trim() ||
+                process.env.VERCEL_AI_GATEWAY_API_KEY?.trim() ||
+                null
+            );
+        case "opencode-go":
+            return process.env.OPENCODE_API_KEY?.trim() || null;
         case "courtlistener":
             return process.env.COURTLISTENER_API_TOKEN?.trim() || null;
         default:
@@ -115,12 +127,16 @@ export async function getUserApiKeyStatus(
         gemini: false,
         openai: false,
         openrouter: false,
+        vercel: false,
+        "opencode-go": false,
         courtlistener: false,
         sources: {
             claude: null,
             gemini: null,
             openai: null,
             openrouter: null,
+            vercel: null,
+            "opencode-go": null,
             courtlistener: null,
         },
     };
@@ -140,7 +156,7 @@ export async function getUserApiKeyStatus(
 
     for (const row of data ?? []) {
         const provider = normalizeApiKeyProvider(String(row.provider));
-        if (provider && !status[provider]) {
+        if (provider) {
             status[provider] = true;
             status.sources[provider] = "user";
         }
@@ -158,6 +174,8 @@ export async function getUserApiKeys(
         gemini: envApiKey("gemini"),
         openai: envApiKey("openai"),
         openrouter: envApiKey("openrouter"),
+        vercel: envApiKey("vercel"),
+        "opencode-go": envApiKey("opencode-go"),
         courtlistener: envApiKey("courtlistener"),
     };
 
@@ -170,8 +188,8 @@ export async function getUserApiKeys(
     for (const row of (data ?? []) as EncryptedKeyRow[]) {
         const provider = normalizeApiKeyProvider(row.provider);
         if (!provider) continue;
-        if (apiKeys[provider]?.trim()) continue;
-        apiKeys[provider] = decrypt(row);
+        const userKey = decrypt(row)?.trim() || null;
+        if (userKey) apiKeys[provider] = userKey;
     }
 
     return apiKeys;

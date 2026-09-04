@@ -6,6 +6,7 @@ import {
     useContext,
     useEffect,
     useMemo,
+  useRef,
     useState,
     type ReactNode,
 } from "react";
@@ -21,19 +22,17 @@ import type { Chat, Message } from "@/app/components/shared/types";
 interface ChatHistoryContextType {
     chats: Chat[] | null;
     hasMoreChats: boolean;
+  loadingMoreChats: boolean;
     currentChatId: string | null;
     setCurrentChatId: (chatId: string | null) => void;
     loadChats: () => Promise<void>;
-    loadMoreChats: () => void;
+  loadMoreChats: () => Promise<void>;
     saveChat: (projectId?: string) => Promise<string | null>;
     renameChat: (chatId: string, title: string) => Promise<void>;
+    updateChatTitle: (chatId: string, title: string) => void;
     newChatMessages: Message[] | null;
     setNewChatMessages: (messages: Message[] | null) => void;
-    replaceChatId: (
-        oldChatId: string,
-        newChatId: string,
-        title?: string,
-    ) => void;
+  replaceChatId: (oldChatId: string, newChatId: string, title?: string) => void;
     deleteChat: (chatId: string) => Promise<void>;
 }
 
@@ -42,13 +41,14 @@ const ChatHistoryContext = createContext<ChatHistoryContextType | undefined>(
 );
 
 const INITIAL_CHAT_LIMIT = 20;
-const CHAT_LIMIT_INCREMENT = 10;
+const CHAT_PAGE_SIZE = 10;
 
 export function ChatHistoryProvider({ children }: { children: ReactNode }) {
     const { user } = useAuth();
     const [chats, setChats] = useState<Chat[] | null>(null);
-    const [chatLimit, setChatLimit] = useState(INITIAL_CHAT_LIMIT);
     const [hasMoreChats, setHasMoreChats] = useState(false);
+  const [loadingMoreChats, setLoadingMoreChats] = useState(false);
+  const loadingMoreChatsRef = useRef(false);
     const [currentChatId, setCurrentChatId] = useState<string | null>(null);
     const [newChatMessages, setNewChatMessages] = useState<Message[] | null>(
         null,
@@ -62,20 +62,21 @@ export function ChatHistoryProvider({ children }: { children: ReactNode }) {
         }
 
         try {
-            const data = await listChats({ limit: chatLimit + 1 });
-            setChats(data.slice(0, chatLimit));
-            setHasMoreChats(data.length > chatLimit);
+      const data = await listChats({ limit: INITIAL_CHAT_LIMIT + 1 });
+      setChats(data.slice(0, INITIAL_CHAT_LIMIT));
+      setHasMoreChats(data.length > INITIAL_CHAT_LIMIT);
         } catch {
             setChats([]);
             setHasMoreChats(false);
         }
-    }, [chatLimit, user]);
+  }, [user]);
 
     useEffect(() => {
         if (!user) {
             setChats([]);
-            setChatLimit(INITIAL_CHAT_LIMIT);
             setHasMoreChats(false);
+      setLoadingMoreChats(false);
+      loadingMoreChatsRef.current = false;
             setCurrentChatId(null);
             return;
         }
@@ -83,9 +84,39 @@ export function ChatHistoryProvider({ children }: { children: ReactNode }) {
         void loadChats();
     }, [user, loadChats]);
 
-    const loadMoreChats = useCallback(() => {
-        setChatLimit((prev) => prev + CHAT_LIMIT_INCREMENT);
-    }, []);
+  const loadMoreChats = useCallback(async () => {
+    if (
+      !user ||
+      !hasMoreChats ||
+      loadingMoreChatsRef.current ||
+      chats === null
+    ) {
+      return;
+    }
+
+    loadingMoreChatsRef.current = true;
+    setLoadingMoreChats(true);
+    try {
+      const data = await listChats({
+        limit: CHAT_PAGE_SIZE + 1,
+        offset: chats.length,
+      });
+      const page = data.slice(0, CHAT_PAGE_SIZE);
+      setChats((current) => {
+        const existing = new Set((current ?? []).map((chat) => chat.id));
+        return [
+          ...(current ?? []),
+          ...page.filter((chat) => !existing.has(chat.id)),
+        ];
+      });
+      setHasMoreChats(data.length > CHAT_PAGE_SIZE);
+    } catch {
+      // Preserve the current page and allow another scroll to retry.
+    } finally {
+      loadingMoreChatsRef.current = false;
+      setLoadingMoreChats(false);
+    }
+  }, [chats, hasMoreChats, user]);
 
     const replaceChatId = useCallback(
         (oldChatId: string, newChatId: string, title?: string) => {
@@ -141,9 +172,7 @@ export function ChatHistoryProvider({ children }: { children: ReactNode }) {
     const renameChatFn = useCallback(
         async (chatId: string, title: string) => {
             setChats((prev) =>
-                (prev ?? []).map((c) =>
-                    c.id === chatId ? { ...c, title } : c,
-                ),
+        (prev ?? []).map((c) => (c.id === chatId ? { ...c, title } : c)),
             );
             try {
                 await renameChat(chatId, title);
@@ -153,6 +182,14 @@ export function ChatHistoryProvider({ children }: { children: ReactNode }) {
         },
         [loadChats],
     );
+
+    const updateChatTitle = useCallback((chatId: string, title: string) => {
+        setChats((prev) =>
+            (prev ?? []).map((chat) =>
+                chat.id === chatId ? { ...chat, title } : chat,
+            ),
+        );
+    }, []);
 
     const deleteChatFn = useCallback(
         async (chatId: string) => {
@@ -171,12 +208,14 @@ export function ChatHistoryProvider({ children }: { children: ReactNode }) {
         () => ({
             chats,
             hasMoreChats,
+      loadingMoreChats,
             currentChatId,
             setCurrentChatId,
             loadChats,
             loadMoreChats,
             saveChat,
             renameChat: renameChatFn,
+            updateChatTitle,
             newChatMessages,
             setNewChatMessages,
             replaceChatId,
@@ -185,11 +224,13 @@ export function ChatHistoryProvider({ children }: { children: ReactNode }) {
         [
             chats,
             hasMoreChats,
+      loadingMoreChats,
             currentChatId,
             loadChats,
             loadMoreChats,
             saveChat,
             renameChatFn,
+            updateChatTitle,
             newChatMessages,
             replaceChatId,
             deleteChatFn,

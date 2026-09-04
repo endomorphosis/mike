@@ -3,7 +3,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Loader2, ZoomIn, ZoomOut } from "lucide-react";
 import { useFetchSingleDoc } from "@/app/hooks/useFetchSingleDoc";
-import { DocxView } from "./DocxView";
 import type { CitationQuote } from "../types";
 import {
     clearHighlights,
@@ -11,9 +10,11 @@ import {
     highlightQuote,
     STANDARD_FONT_DATA_URL,
 } from "./highlightQuote";
+import { LIQUID_GLASS_TRANSLUCENT_CLASS } from "@/shared/ui/LiquidGlassUI";
 
 interface Props {
     doc: { document_id: string; version_id?: string | null } | null;
+    displayUrl?: string | null;
     /** Preferred: one or more (page, quote) pairs to highlight. */
     quotes?: CitationQuote[];
     /** Changes when the parent wants the current quote re-focused. */
@@ -39,8 +40,25 @@ type RenderedPage = {
     textDivs: HTMLElement[];
 };
 
+/**
+ * ResizeObserver's content box shrinks when an overflow scrollbar appears.
+ * The border box does not, so it is the stable measurement for deciding when
+ * the viewer's containing panel has actually been resized.
+ */
+export function getObservedPanelWidth(entry: ResizeObserverEntry): number {
+    const borderBoxSize = entry.borderBoxSize as
+        | readonly ResizeObserverSize[]
+        | ResizeObserverSize
+        | undefined;
+    const borderBox = Array.isArray(borderBoxSize)
+        ? borderBoxSize[0]
+        : borderBoxSize;
+    return Math.round(borderBox?.inlineSize ?? entry.contentRect.width);
+}
+
 export function PdfView({
     doc,
+    displayUrl,
     quotes,
     quoteFocusKey,
     quote,
@@ -53,6 +71,7 @@ export function PdfView({
         null,
     );
     const renderedPagesRef = useRef<RenderedPage[]>([]);
+    const renderGenerationRef = useRef(0);
     const quoteListRef = useRef<QuoteEntry[]>([]);
     const zoomRef = useRef(1.0);
     const currentPageRef = useRef(1);
@@ -77,19 +96,19 @@ export function PdfView({
     const { result, loading, error } = useFetchSingleDoc(
         doc?.document_id ?? null,
         doc?.version_id ?? null,
+        displayUrl,
     );
-
-    // /display returned DOCX bytes — the active version has no PDF
-    // rendition, so fall back to docx-preview (still applies citation
-    // highlighting via the same `quotes` API).
-    const fallbackToDocx = result?.type === "docx";
 
     // Track container width via ResizeObserver so re-renders fire on resize
     useEffect(() => {
         const el = scrollContainerRef.current;
         if (!el) return;
         const ro = new ResizeObserver((entries) => {
-            setContainerWidth(entries[0]?.contentRect.width ?? 0);
+            const entry = entries[0];
+            const nextWidth = entry ? getObservedPanelWidth(entry) : 0;
+            setContainerWidth((currentWidth) =>
+                currentWidth === nextWidth ? currentWidth : nextWidth,
+            );
         });
         ro.observe(el);
         return () => ro.disconnect();
@@ -173,134 +192,12 @@ export function PdfView({
         [],
     );
 
-    const renderPDF = useCallback(
-        async (
-            doc: import("pdfjs-dist").PDFDocumentProxy,
-            list: QuoteEntry[],
-            scrollToPage?: number,
-        ) => {
-            if (!containerRef.current) return;
-            containerRef.current.innerHTML = "";
-            renderedPagesRef.current = [];
-            const lib = await getPdfJs();
-            lib.TextLayer.cleanup();
-
-            setNumPages(doc.numPages);
-            setCurrentPage(1);
-            currentPageRef.current = 1;
-
-            const hasCitation = list.length > 0;
-            if (hasCitation && scrollContainerRef.current) {
-                scrollContainerRef.current.style.opacity = "0";
-            }
-
-            const reveal = () => {
-                if (scrollContainerRef.current)
-                    scrollContainerRef.current.style.opacity = "1";
-            };
-
-            const panelW = containerRef.current.clientWidth;
-            const firstPage = await doc.getPage(1);
-            const naturalWidth = firstPage.getViewport({ scale: 1 }).width;
-            const baseScale = Math.max(
-                0.5,
-                (panelW - SIDE_PADDING) / naturalWidth,
-            );
-            const scale = baseScale * zoomRef.current;
-
-            for (let pageNum = 1; pageNum <= doc.numPages; pageNum++) {
-                const page = await doc.getPage(pageNum);
-                const viewport = page.getViewport({ scale });
-
-                const wrapper = document.createElement("div");
-                wrapper.style.position = "relative";
-                wrapper.style.margin = "0 auto 8px";
-                wrapper.style.width = "fit-content";
-                wrapper.className = "shadow-md";
-
-                const canvas = document.createElement("canvas");
-                canvas.width = viewport.width;
-                canvas.height = viewport.height;
-                canvas.style.display = "block";
-                wrapper.appendChild(canvas);
-                containerRef.current?.appendChild(wrapper);
-
-                const ctx = canvas.getContext("2d");
-                if (!ctx) continue;
-
-                const task = page.render({ canvasContext: ctx, viewport });
-                try {
-                    await task.promise;
-                } catch (e: unknown) {
-                    if (
-                        (e as { name?: string })?.name !==
-                        "RenderingCancelledException"
-                    ) {
-                        console.error("PDF render error", e);
-                    }
-                    continue;
-                }
-
-                const textLayerDiv = document.createElement("div");
-                textLayerDiv.className = "pdf-text-layer";
-                textLayerDiv.style.position = "absolute";
-                textLayerDiv.style.left = "0";
-                textLayerDiv.style.top = "0";
-                textLayerDiv.style.width = `${viewport.width}px`;
-                textLayerDiv.style.height = `${viewport.height}px`;
-                textLayerDiv.style.setProperty("--scale-factor", String(scale));
-                wrapper.appendChild(textLayerDiv);
-
-                const textLayer = new lib.TextLayer({
-                    textContentSource: page.streamTextContent(),
-                    container: textLayerDiv,
-                    viewport,
-                });
-                await textLayer.render();
-                const textDivs = textLayer.textDivs;
-
-                renderedPagesRef.current.push({
-                    page,
-                    viewport,
-                    wrapper,
-                    canvas,
-                    textDivs,
-                });
-            }
-
-            // Apply highlights across all entries, then scroll to the first hit.
-            let targetPage: number | null = null;
-            if (list.length) {
-                targetPage = await applyHighlights(list);
-                if (targetPage === null) {
-                    // Fallback: scroll to the first entry's page hint, even without a highlight
-                    const hint = list.find((e) => e.page)?.page ?? null;
-                    targetPage = hint;
-                }
-            }
-            if (targetPage && targetPage >= 1) {
-                scrollToHighlightOnPage(targetPage);
-            } else if (!hasCitation && scrollToPage && scrollToPage > 1) {
-                // Restore scroll position after zoom re-render
-                const pageEntry = renderedPagesRef.current[scrollToPage - 1];
-                if (pageEntry)
-                    pageEntry.wrapper.scrollIntoView({
-                        behavior: "instant" as ScrollBehavior,
-                        block: "start",
-                    });
-            }
-
-            reveal();
-        },
-        [applyHighlights],
-    );
-
     // Scroll so the first highlight on `pageNum` lands at the vertical center
     // of the viewer. We compute the scroll position explicitly on the scroll
     // container — calling `scrollIntoView` on a child of the absolutely-
     // positioned text layer can scroll just the overlay while leaving the
     // canvas untouched, which is why we don't use it here.
-    function scrollToHighlightOnPage(pageNum: number) {
+    const scrollToHighlightOnPage = useCallback((pageNum: number) => {
         const pageEntry = renderedPagesRef.current[pageNum - 1];
         const scrollEl = scrollContainerRef.current;
         if (!pageEntry || !scrollEl) return;
@@ -331,7 +228,143 @@ export function PdfView({
                 behavior: "instant" as ScrollBehavior,
             });
         }
-    }
+    }, []);
+
+    const renderPDF = useCallback(
+        async (
+            doc: import("pdfjs-dist").PDFDocumentProxy,
+            list: QuoteEntry[],
+            scrollToPage?: number,
+        ) => {
+            const container = containerRef.current;
+            if (!container) return;
+            const renderGeneration = ++renderGenerationRef.current;
+            const isStale = () =>
+                renderGenerationRef.current !== renderGeneration ||
+                containerRef.current !== container;
+
+            container.innerHTML = "";
+            renderedPagesRef.current = [];
+            const lib = await getPdfJs();
+            if (isStale()) return;
+            lib.TextLayer.cleanup();
+
+            setNumPages(doc.numPages);
+            setCurrentPage(1);
+            currentPageRef.current = 1;
+
+            const hasCitation = list.length > 0;
+            if (hasCitation && scrollContainerRef.current) {
+                scrollContainerRef.current.style.opacity = "0";
+            }
+
+            const reveal = () => {
+                if (scrollContainerRef.current)
+                    scrollContainerRef.current.style.opacity = "1";
+            };
+
+            const panelW = container.clientWidth;
+            const firstPage = await doc.getPage(1);
+            if (isStale()) return;
+            const naturalWidth = firstPage.getViewport({ scale: 1 }).width;
+            const baseScale = Math.max(
+                0.5,
+                (panelW - SIDE_PADDING) / naturalWidth,
+            );
+            const scale = baseScale * zoomRef.current;
+
+            for (let pageNum = 1; pageNum <= doc.numPages; pageNum++) {
+                const page = await doc.getPage(pageNum);
+                if (isStale()) return;
+                const viewport = page.getViewport({ scale });
+
+                const wrapper = document.createElement("div");
+                wrapper.style.position = "relative";
+                wrapper.style.margin = "0 auto 8px";
+                wrapper.style.width = "fit-content";
+                wrapper.className = "shadow-md";
+
+                const canvas = document.createElement("canvas");
+                canvas.width = viewport.width;
+                canvas.height = viewport.height;
+                canvas.style.display = "block";
+                wrapper.appendChild(canvas);
+                container.appendChild(wrapper);
+
+                const ctx = canvas.getContext("2d");
+                if (!ctx) continue;
+
+                const task = page.render({ canvasContext: ctx, viewport });
+                try {
+                    await task.promise;
+                    if (isStale()) return;
+                } catch (e: unknown) {
+                    if (isStale()) return;
+                    if (
+                        (e as { name?: string })?.name !==
+                        "RenderingCancelledException"
+                    ) {
+                        console.error("PDF render error", e);
+                    }
+                    continue;
+                }
+
+                const textLayerDiv = document.createElement("div");
+                textLayerDiv.className = "pdf-text-layer";
+                textLayerDiv.style.position = "absolute";
+                textLayerDiv.style.left = "0";
+                textLayerDiv.style.top = "0";
+                textLayerDiv.style.width = `${viewport.width}px`;
+                textLayerDiv.style.height = `${viewport.height}px`;
+                textLayerDiv.style.setProperty("--scale-factor", String(scale));
+                wrapper.appendChild(textLayerDiv);
+
+                const textLayer = new lib.TextLayer({
+                    textContentSource: page.streamTextContent(),
+                    container: textLayerDiv,
+                    viewport,
+                });
+                await textLayer.render();
+                if (isStale()) return;
+                const textDivs = textLayer.textDivs;
+
+                renderedPagesRef.current.push({
+                    page,
+                    viewport,
+                    wrapper,
+                    canvas,
+                    textDivs,
+                });
+            }
+
+            if (isStale()) return;
+
+            // Apply highlights across all entries, then scroll to the first hit.
+            let targetPage: number | null = null;
+            if (list.length) {
+                targetPage = await applyHighlights(list);
+                if (targetPage === null) {
+                    // Fallback: scroll to the first entry's page hint, even without a highlight
+                    const hint = list.find((e) => e.page)?.page ?? null;
+                    targetPage = hint;
+                }
+            }
+            if (targetPage && targetPage >= 1) {
+                scrollToHighlightOnPage(targetPage);
+            } else if (!hasCitation && scrollToPage && scrollToPage > 1) {
+                // Restore scroll position after zoom re-render
+                const pageEntry = renderedPagesRef.current[scrollToPage - 1];
+                if (pageEntry)
+                    pageEntry.wrapper.scrollIntoView({
+                        behavior: "instant" as ScrollBehavior,
+                        block: "start",
+                    });
+            }
+
+            reveal();
+        },
+        [applyHighlights, scrollToHighlightOnPage],
+    );
 
     const rehighlightQuotes = useCallback(
         async (list: QuoteEntry[]) => {
@@ -342,7 +375,7 @@ export function PdfView({
                 scrollToHighlightOnPage(scrollPage);
             }
         },
-        [applyHighlights],
+        [applyHighlights, scrollToHighlightOnPage],
     );
 
     // Trackpad pinch-to-zoom (wheel + ctrlKey)
@@ -448,6 +481,7 @@ export function PdfView({
     // Clean up PDF.js static font-measurement canvases on unmount
     useEffect(() => {
         return () => {
+            renderGenerationRef.current += 1;
             getPdfJs().then((lib) => lib.TextLayer.cleanup());
         };
     }, []);
@@ -459,11 +493,15 @@ export function PdfView({
         renderedPagesRef.current = [];
         quoteListRef.current = quoteList;
         zoomRef.current = 1.0;
-        setZoom(1.0);
-        setNumPages(0);
         const list = quoteList;
 
         let cancelled = false;
+        queueMicrotask(() => {
+            if (cancelled) return;
+            setZoom(1.0);
+            setNumPages(0);
+        });
+
         (async () => {
             const lib = await getPdfJs();
             if (cancelled) return;
@@ -477,6 +515,7 @@ export function PdfView({
         })();
         return () => {
             cancelled = true;
+            renderGenerationRef.current += 1;
         };
     }, [result, renderPDF]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -489,7 +528,7 @@ export function PdfView({
             }
         }, 150);
         return () => clearTimeout(timer);
-    }, [containerWidth, renderPDF]); // eslint-disable-line react-hooks/exhaustive-deps
+    }, [containerWidth, renderPDF]);
 
     // Re-highlight when quotes change without full re-render
     useEffect(() => {
@@ -530,25 +569,13 @@ export function PdfView({
         }
     }
 
-    if (fallbackToDocx && doc?.document_id) {
-        return (
-            <DocxView
-                documentId={doc.document_id}
-                versionId={doc.version_id ?? null}
-                quotes={quotes}
-                quoteFocusKey={quoteFocusKey}
-                rounded={rounded}
-            />
-        );
-    }
-
     return (
         <div
             className={`relative flex flex-col bg-gray-100 flex-1 overflow-hidden ${rounded ? "rounded-lg" : ""}`}
         >
             <div
                 ref={scrollContainerRef}
-                className="flex-1 overflow-auto px-3 pt-5 pb-3"
+                className="flex-1 overflow-auto px-3 pt-5 pb-3 [scrollbar-gutter:stable]"
             >
                 {loading && (
                     <div className="flex h-full items-center justify-center">
@@ -566,13 +593,17 @@ export function PdfView({
                 <>
                     {/* Page counter — bottom left */}
                     <div className="absolute bottom-4 left-4 pointer-events-none">
-                        <span className="flex items-center px-3 py-1.5 rounded-full text-xs font-medium tabular-nums text-gray-700 bg-white/25 backdrop-blur-md border border-white/30 shadow-md">
+                        <span
+                            className={`flex items-center rounded-full px-3 py-1.5 text-xs font-medium tabular-nums text-gray-700 ${LIQUID_GLASS_TRANSLUCENT_CLASS}`}
+                        >
                             {currentPage}/{numPages}
                         </span>
                     </div>
 
                     {/* Zoom controls — bottom right */}
-                    <div className="absolute bottom-4 right-4 flex items-center gap-px rounded-full bg-white/25 backdrop-blur-md border border-white/30 shadow-md px-1 py-1">
+                    <div
+                        className={`absolute bottom-4 right-4 flex items-center gap-px rounded-full px-1 py-1 ${LIQUID_GLASS_TRANSLUCENT_CLASS}`}
+                    >
                         <button
                             onClick={handleZoomOut}
                             disabled={zoom <= ZOOM_MIN}

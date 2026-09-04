@@ -3,85 +3,215 @@
 import { useEffect, useRef, useState } from "react";
 import { AlertCircle, Upload, Loader2, X } from "lucide-react";
 import {
-    uploadStandaloneDocument,
-    uploadProjectDocument,
+    UploadBatchError,
+    failedUploadMessage,
+    uploadStandaloneDocuments,
+    uploadProjectDocuments,
     addDocumentToProject,
+    getProject,
+    type UploadProgress,
 } from "@/app/lib/mikeApi";
-import type { Document } from "../shared/types";
+import type { Document, Folder } from "../shared/types";
 import { FileDirectory } from "../shared/FileDirectory";
-import {
-    useDirectoryData,
-    invalidateDirectoryCache,
-} from "../shared/useDirectoryData";
+import type { DirectoryTab } from "../shared/useDirectoryData";
 import { Modal } from "./Modal";
 import {
     SUPPORTED_DOCUMENT_ACCEPT,
     formatUnsupportedDocumentWarning,
     partitionSupportedDocumentFiles,
 } from "@/app/lib/documentUploadValidation";
-
-export { invalidateDirectoryCache };
+import { useRemountPersistentState } from "@/app/hooks/useRemountPersistentState";
+import { userFacingApiError } from "@/app/lib/userFacingError";
 
 interface Props {
     open: boolean;
     onClose: () => void;
     onSelect: (documents: Document[], projectId?: string) => void;
     breadcrumb: string[];
-    allowMultiple?: boolean;
+    initialTab?: DirectoryTab;
     projectId?: string;
+    initialSelectedDocuments?: Document[];
+    /** Documents uploaded outside the modal while it is mounted. */
+    externalUploadedDocuments?: Document[];
+    /** Keep the modal mounted (hidden) while closed so the loaded
+     * directory listing survives close/reopen cycles. */
+    keepMounted?: boolean;
+    /** Limit the directory to the target project's files and folder tree. */
+    projectDocumentsOnly?: boolean;
+    tabs?: readonly DirectoryTab[];
+    disabledDocumentIds?: ReadonlySet<string>;
+    /**
+     * Stable identity of the surface that owns in-flight uploads, used to key
+     * the state that survives a remount. Defaults to the modal's own
+     * identifying props; pass one when a screen mounts more than one picker,
+     * or when two screens would otherwise share the default. Never derive this
+     * from display text: renaming the project or review mid-upload would move
+     * the key and strand the running upload in an orphaned store entry, so the
+     * finished documents never reach the selection.
+     */
+    uploadStateId?: string;
 }
+
+const DIRECTORY_PAGE_SIZE = 40;
 
 export function AddDocumentsModal({
     open,
     onClose,
     onSelect,
     breadcrumb,
-    allowMultiple = true,
+    initialTab = "files",
     projectId,
+    initialSelectedDocuments,
+    externalUploadedDocuments,
+    keepMounted = false,
+    projectDocumentsOnly = false,
+    tabs,
+    disabledDocumentIds,
+    uploadStateId,
 }: Props) {
-    const { loading, standaloneDocuments, projects } = useDirectoryData(open);
-    const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-    const [uploading, setUploading] = useState(false);
-    const [uploadingFilenames, setUploadingFilenames] = useState<string[]>([]);
+    const uploadSurfaceId =
+        uploadStateId ??
+        [
+            projectId ?? "standalone",
+            projectDocumentsOnly ? "project" : "all",
+            initialTab,
+        ].join(":");
+    const uploadStateKey = `add-documents-upload:${uploadSurfaceId}`;
+    const [selectedDocuments, setSelectedDocuments] = useState<Document[]>([]);
+    const [uploading, setUploading] = useRemountPersistentState(
+        `${uploadStateKey}:active`,
+        false,
+    );
+    const [uploadingFiles, setUploadingFiles] = useRemountPersistentState<
+        Array<{ clientId: string; filename: string }>
+    >(`${uploadStateKey}:files`, []);
     const [uploadWarning, setUploadWarning] = useState<string | null>(null);
-    const [extraUploadedDocs, setExtraUploadedDocs] = useState<Document[]>([]);
+    const [extraUploadedDocs, setExtraUploadedDocs] =
+        useRemountPersistentState<Document[]>(`${uploadStateKey}:documents`, []);
+    const [projectDocuments, setProjectDocuments] = useState<Document[]>([]);
+    const [projectFolders, setProjectFolders] = useState<Folder[]>([]);
+    const [projectDirectoryLoading, setProjectDirectoryLoading] =
+        useState(false);
+    const [projectDocumentLimitByLevel, setProjectDocumentLimitByLevel] =
+        useState<Record<string, number>>({ root: DIRECTORY_PAGE_SIZE });
+    const [loadedProjectFolderIds, setLoadedProjectFolderIds] = useState<
+        Set<string>
+    >(new Set());
+    // Tracks whether the modal has ever been opened, so keepMounted only
+    // keeps it (and its directory fetch) alive after first use rather than
+    // eagerly loading on page mount.
+    const [hasOpened, setHasOpened] = useState(open);
     const fileInputRef = useRef<HTMLInputElement>(null);
+    const wasOpenRef = useRef(false);
 
     useEffect(() => {
-        if (!open) return;
-        setSelectedIds(new Set());
-        setExtraUploadedDocs([]);
-        setUploadingFilenames([]);
-        setUploadWarning(null);
+        if (open) setHasOpened(true);
     }, [open]);
 
-    if (!open) return null;
+    useEffect(() => {
+        if (!open || !projectDocumentsOnly || !projectId) return;
+        let cancelled = false;
+        setProjectDirectoryLoading(true);
+        getProject(projectId)
+            .then((project) => {
+                if (cancelled) return;
+                setProjectDocuments(
+                    (project.documents ?? []).filter(
+                        (document) => document.status === "ready",
+                    ),
+                );
+                setProjectFolders(project.folders ?? []);
+                setProjectDocumentLimitByLevel({ root: DIRECTORY_PAGE_SIZE });
+                setLoadedProjectFolderIds(new Set());
+            })
+            .catch(() => {
+                if (cancelled) return;
+                setProjectDocuments([]);
+                setProjectFolders([]);
+            })
+            .finally(() => {
+                if (!cancelled) setProjectDirectoryLoading(false);
+            });
+        return () => {
+            cancelled = true;
+        };
+    }, [open, projectDocumentsOnly, projectId]);
 
-    const allStandalone = [
-        ...extraUploadedDocs.filter(
-            (u) => !standaloneDocuments.some((d) => d.id === u.id),
-        ),
-        ...standaloneDocuments,
-    ];
+    // Key the sync on the id list itself so a reopen targeting different
+    // documents (or ids arriving late) always re-seeds the selection.
+    const initialSelectionKey = (initialSelectedDocuments ?? [])
+        .map((document) => document.id)
+        .join("|");
+    useEffect(() => {
+        if (!open) {
+            wasOpenRef.current = false;
+            return;
+        }
+        const resumedAfterRemount = uploading || uploadingFiles.length > 0;
+        setSelectedDocuments((prev) => {
+            if (!wasOpenRef.current && !resumedAfterRemount) {
+                return initialSelectedDocuments ?? [];
+            }
+            const next = new Map(
+                prev.map((document) => [document.id, document]),
+            );
+            for (const document of initialSelectedDocuments ?? []) {
+                next.set(document.id, document);
+            }
+            for (const document of extraUploadedDocs) {
+                next.set(document.id, document);
+            }
+            return [...next.values()];
+        });
+        if (!wasOpenRef.current && !resumedAfterRemount) {
+            setUploadingFiles([]);
+            setUploadWarning(null);
+        }
+        if (!keepMounted && !wasOpenRef.current && !resumedAfterRemount) {
+            // When kept mounted there is no refetch on reopen, so the
+            // listing (including this session's uploads) must survive.
+            setExtraUploadedDocs([]);
+        }
+        wasOpenRef.current = true;
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [open, initialSelectionKey, uploadStateKey]);
 
-    const availableProjects = projects
-        .filter((p) => p.id !== projectId)
-        .map((p) => ({
-            ...p,
-            documents: p.documents || [],
-        }));
+    const externalUploadKey = (externalUploadedDocuments ?? [])
+        .map((document) => document.id)
+        .join("|");
+    useEffect(() => {
+        if (!externalUploadedDocuments?.length) return;
+        setExtraUploadedDocs((prev) => {
+            const next = new Map(
+                prev.map((document) => [document.id, document]),
+            );
+            for (const document of externalUploadedDocuments) {
+                next.set(document.id, document);
+            }
+            return [...next.values()];
+        });
+        if (open) {
+            setSelectedDocuments((prev) => {
+                const next = new Map(
+                    prev.map((document) => [document.id, document]),
+                );
+                for (const document of externalUploadedDocuments) {
+                    next.set(document.id, document);
+                }
+                return [...next.values()];
+            });
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [externalUploadKey]);
 
-    const allDocs = [
-        ...allStandalone,
-        ...availableProjects.flatMap((p) => p.documents || []),
-    ];
+    if (!open && (!keepMounted || !hasOpened)) return null;
 
     async function handleConfirm() {
-        const selected = allDocs.filter((d) => selectedIds.has(d.id));
-
         if (projectId) {
-            const toAssign = selected.filter((d) => d.project_id !== projectId);
-            const alreadyHere = selected.filter(
+            const toAssign = selectedDocuments.filter(
+                (d) => d.project_id !== projectId,
+            );
+            const alreadyHere = selectedDocuments.filter(
                 (d) => d.project_id === projectId,
             );
             if (toAssign.length > 0) {
@@ -106,11 +236,11 @@ export function AddDocumentsModal({
         }
 
         const projectIds = new Set(
-            selected.map((d) => d.project_id).filter(Boolean),
+            selectedDocuments.map((d) => d.project_id).filter(Boolean),
         );
         const singleProjectId =
             projectIds.size === 1 ? [...projectIds][0]! : undefined;
-        onSelect(selected, singleProjectId);
+        onSelect(selectedDocuments, singleProjectId);
         onClose();
     }
 
@@ -124,34 +254,133 @@ export function AddDocumentsModal({
             if (fileInputRef.current) fileInputRef.current.value = "";
             return;
         }
-        setUploadingFilenames(supported.map((file) => file.name));
+        const uploadInputs = supported.map((file) => ({
+            file,
+            clientId: crypto.randomUUID(),
+        }));
+        setUploadingFiles(
+            uploadInputs.map(({ clientId, file }) => ({
+                clientId,
+                filename: file.name,
+            })),
+        );
         setUploading(true);
+        const addUploadedDocument = (document: Document) => {
+            setExtraUploadedDocs((current) =>
+                current.some((existing) => existing.id === document.id)
+                    ? current
+                    : [document, ...current],
+            );
+            setSelectedDocuments((current) =>
+                current.some((existing) => existing.id === document.id)
+                    ? current
+                    : [...current, document],
+            );
+        };
+        const handleProgress = (progress: UploadProgress<Document>) => {
+            if (progress.status === "completed" || progress.status === "error") {
+                setUploadingFiles((current) =>
+                    current.filter(
+                        (upload) => upload.clientId !== progress.clientId,
+                    ),
+                );
+            }
+            if (progress.status === "completed" && progress.result) {
+                addUploadedDocument(progress.result);
+            }
+        };
         try {
-            const uploaded = await Promise.all(
-                supported.map((f) =>
-                    projectId
-                        ? uploadProjectDocument(projectId, f)
-                        : uploadStandaloneDocument(f),
-                ),
+            const outcomes = projectId
+                ? await uploadProjectDocuments(
+                      projectId,
+                      uploadInputs,
+                      { onProgress: handleProgress },
+                  )
+                : await uploadStandaloneDocuments(
+                      uploadInputs,
+                      { onProgress: handleProgress },
+                  );
+            const uploaded = outcomes.flatMap((outcome) =>
+                outcome.status === "completed" && outcome.result
+                    ? [outcome.result]
+                    : [],
             );
-            invalidateDirectoryCache();
-            setExtraUploadedDocs((prev) => [...uploaded, ...prev]);
-            uploaded.forEach((d) =>
-                setSelectedIds((prev) => new Set([...prev, d.id])),
-            );
+            const failedCount = outcomes.length - uploaded.length;
+            if (failedCount > 0) {
+                setUploadWarning((current) =>
+                    [
+                        current,
+                        failedUploadMessage(outcomes),
+                    ]
+                        .filter(Boolean)
+                        .join(" "),
+                );
+            }
+            uploaded.forEach(addUploadedDocument);
         } catch (err) {
             console.error("Upload failed:", err);
+            setUploadWarning(
+                err instanceof UploadBatchError
+                    ? failedUploadMessage(err.outcomes)
+                    : userFacingApiError(
+                          err,
+                          "Documents could not be uploaded. Please try again.",
+                      ),
+            );
         } finally {
             setUploading(false);
-            setUploadingFilenames([]);
+            setUploadingFiles([]);
             if (fileInputRef.current) fileInputRef.current.value = "";
         }
+    }
+
+    const directoryDocuments = projectDocumentsOnly
+        ? [
+              ...extraUploadedDocs,
+              ...projectDocuments.filter(
+                  (document) =>
+                      !extraUploadedDocs.some(
+                          (uploaded) => uploaded.id === document.id,
+                      ),
+              ),
+          ]
+        : extraUploadedDocs;
+    const projectDocumentCountsByLevel: Record<string, number> = {};
+    directoryDocuments.forEach((document) => {
+        const key = document.folder_id ?? "root";
+        projectDocumentCountsByLevel[key] =
+            (projectDocumentCountsByLevel[key] ?? 0) + 1;
+    });
+    const projectDocumentsHasMoreByFolder = Object.fromEntries(
+        [...loadedProjectFolderIds].map((folderId) => [
+            folderId,
+            (projectDocumentCountsByLevel[folderId] ?? 0) >
+                (projectDocumentLimitByLevel[folderId] ?? DIRECTORY_PAGE_SIZE),
+        ]),
+    );
+
+    function handleExpandProjectFolder(folderId: string) {
+        setLoadedProjectFolderIds((current) => new Set(current).add(folderId));
+        setProjectDocumentLimitByLevel((current) =>
+            current[folderId] != null
+                ? current
+                : { ...current, [folderId]: DIRECTORY_PAGE_SIZE },
+        );
+    }
+
+    function handleLoadMoreProjectLevel(parentId: string | null) {
+        const key = parentId ?? "root";
+        setProjectDocumentLimitByLevel((current) => ({
+            ...current,
+            [key]: (current[key] ?? DIRECTORY_PAGE_SIZE) + DIRECTORY_PAGE_SIZE,
+        }));
     }
 
     return (
         <Modal
             open={open}
             onClose={onClose}
+            keepMounted={keepMounted}
             breadcrumbs={breadcrumb}
             secondaryAction={{
                 label: uploading ? "Uploading…" : "Upload",
@@ -163,17 +392,10 @@ export function AddDocumentsModal({
                 onClick: () => fileInputRef.current?.click(),
                 disabled: uploading,
             }}
-            footerStatus={
-                selectedIds.size > 0 ? (
-                    <span className="text-xs text-gray-400">
-                        {selectedIds.size} selected
-                    </span>
-                ) : null
-            }
             primaryAction={{
                 label: uploading ? "Saving…" : "Confirm",
                 onClick: handleConfirm,
-                disabled: selectedIds.size === 0 || uploading,
+                disabled: selectedDocuments.length === 0 || uploading,
             }}
         >
             <input
@@ -202,18 +424,41 @@ export function AddDocumentsModal({
 
             <div className="flex min-h-0 flex-1 flex-col">
                 <FileDirectory
-                    standaloneDocs={allStandalone}
-                    directoryProjects={availableProjects}
-                    loading={loading}
-                    selectedIds={selectedIds}
-                    onChange={setSelectedIds}
-                    allowMultiple={allowMultiple}
-                    emptyMessage="No documents yet"
-                    uploadingFilenames={uploadingFilenames}
-                    searchable
-                    searchAutoFocus
-                    searchNoResultsMessage="No matches found"
-                    showProjectTabs
+                    documents={directoryDocuments}
+                    folders={projectDocumentsOnly ? projectFolders : undefined}
+                    loading={projectDirectoryLoading}
+                    selectedDocuments={selectedDocuments}
+                    onChange={setSelectedDocuments}
+                    uploadingFilenames={uploadingFiles.map(
+                        (upload) => upload.filename,
+                    )}
+                    showTabs={!projectDocumentsOnly}
+                    initialTab={initialTab}
+                    tabs={tabs}
+                    excludeProjectId={
+                        projectDocumentsOnly ? undefined : projectId
+                    }
+                    disabledDocumentIds={disabledDocumentIds}
+                    onExpandFolder={
+                        projectDocumentsOnly
+                            ? handleExpandProjectFolder
+                            : undefined
+                    }
+                    loadedFolderIds={loadedProjectFolderIds}
+                    documentLimitByLevel={projectDocumentLimitByLevel}
+                    documentsHasMoreByFolder={projectDocumentsHasMoreByFolder}
+                    onLoadMoreFolderDocuments={(folderId) =>
+                        handleLoadMoreProjectLevel(folderId)
+                    }
+                    rootDocumentsHasMore={
+                        projectDocumentsOnly &&
+                        (projectDocumentCountsByLevel.root ?? 0) >
+                            (projectDocumentLimitByLevel.root ??
+                                DIRECTORY_PAGE_SIZE)
+                    }
+                    onLoadMoreRootDocuments={() =>
+                        handleLoadMoreProjectLevel(null)
+                    }
                 />
             </div>
         </Modal>

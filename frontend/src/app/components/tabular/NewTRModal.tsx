@@ -2,38 +2,52 @@
 
 import { useEffect, useRef, useState } from "react";
 import { Loader2, Upload } from "lucide-react";
-import type { Document, Project, Workflow } from "../shared/types";
+import type { Document, Folder, Project, Workflow } from "../shared/types";
 import {
+    UploadBatchError,
+    failedUploadMessage,
     getProject,
-    listProjects,
-    listStandaloneDocuments,
     listWorkflows,
-    uploadProjectDocument,
-    uploadStandaloneDocument,
+    uploadProjectDocuments,
+    uploadStandaloneDocuments,
 } from "@/app/lib/mikeApi";
+import { userFacingApiError } from "@/app/lib/userFacingError";
 import { FileDirectory } from "../shared/FileDirectory";
 import { Modal } from "../modals/Modal";
-import { ModalFieldLabel } from "../modals/ModalFieldLabel";
 import { ModalSelect } from "../modals/ModalSelect";
-import { ModalTextInput } from "../modals/ModalTextInput";
+import { FieldLabel, FormTextInput } from "../ui/form-field";
+import { ToggleSwitch } from "@/app/components/ui/toggle-switch";
+import {
+    ModelToggle,
+    type NoModelsReason,
+    type RouterSlug,
+} from "../assistant/ModelToggle";
+import { useUserProfile } from "@/app/contexts/UserProfileContext";
+import { isModelAvailable } from "@/app/lib/modelAvailability";
+import { NoModelsWarningPopup } from "../popups/NoModelsWarningPopup";
 
 const isDev = process.env.NODE_ENV !== "production";
 const devLog = (...args: Parameters<typeof console.log>) => {
     if (isDev) console.log(...args);
 };
+const TABULAR_DIRECTORY_TABS = ["files", "projects"] as const;
 
 interface Props {
     open: boolean;
     onClose: () => void;
     onAdd: (
         title: string,
-        projectId?: string,
-        documentIds?: string[],
-        columnsConfig?: Workflow["columns_config"],
+        projectId: string | undefined,
+        documentIds: string[] | undefined,
+        columnsConfig: Workflow["columns_config"] | undefined,
+        documentGrouping: "document" | "folder" | undefined,
+        model: string,
     ) => void;
     projects?: Project[];
     /** When provided, skip the project/directory picker and show only these docs */
     projectDocs?: Document[];
+    projectFolders?: Folder[];
+    projectId?: string;
     projectName?: string;
     projectCmNumber?: string | null;
 }
@@ -44,30 +58,35 @@ export function NewTRModal({
     onAdd,
     projects = [],
     projectDocs: fixedProjectDocs,
+    projectFolders: fixedProjectFolders,
+    projectId,
     projectName,
     projectCmNumber,
 }: Props) {
-    const isProjectMode = fixedProjectDocs !== undefined;
+    const isProjectMode = projectId !== undefined;
     const [step, setStep] = useState<"details" | "documents">("details");
     const [title, setTitle] = useState("");
     const [underProject, setUnderProject] = useState(false);
     const [selectedProjectId, setSelectedProjectId] = useState("");
+    const [selectedModel, setSelectedModel] = useState("");
+    const [noModelsWarning, setNoModelsWarning] =
+        useState<NoModelsReason | null>(null);
+    const { profile, loading: profileLoading, apiKeysDegraded } =
+        useUserProfile();
+    const apiKeys = apiKeysDegraded ? undefined : profile?.apiKeys;
 
     // Project-scoped docs (when underProject is true and no fixedProjectDocs)
     const [projectDocs, setProjectDocs] = useState<Document[]>([]);
+    const [projectFolders, setProjectFolders] = useState<Folder[]>([]);
     const [loadingDocs, setLoadingDocs] = useState(false);
 
-    // Full directory (when underProject is false)
-    const [standaloneDocs, setStandaloneDocs] = useState<Document[]>([]);
-    const [directoryProjects, setDirectoryProjects] = useState<Project[]>(
+    const [extraStandaloneDocs, setExtraStandaloneDocs] = useState<Document[]>(
         [],
     );
-    const [loadingDirectory, setLoadingDirectory] = useState(false);
-
-    const [selectedDocIds, setSelectedDocIds] = useState<Set<string>>(
-        new Set(),
-    );
+    const [selectedDocuments, setSelectedDocuments] = useState<Document[]>([]);
+    const [groupBySubfolder, setGroupBySubfolder] = useState(false);
     const [uploading, setUploading] = useState(false);
+    const [uploadError, setUploadError] = useState<string | null>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
 
     // Workflow templates
@@ -86,8 +105,9 @@ export function NewTRModal({
             .then((workflows) => {
                 devLog("[workflows/ui:tabular-review-modal] loaded", {
                     workflowCount: workflows.length,
-                    systemCount: workflows.filter((workflow) => workflow.is_system)
-                        .length,
+                    systemCount: workflows.filter(
+                        (workflow) => workflow.is_system,
+                    ).length,
                     sample: workflows.slice(0, 5).map((workflow) => ({
                         id: workflow.id,
                         title: workflow.metadata.title,
@@ -100,43 +120,40 @@ export function NewTRModal({
                 setWorkflows(workflows);
             })
             .catch((error) => {
-                devLog(
-                    "[workflows/ui:tabular-review-modal] failed",
-                    error,
-                );
+                devLog("[workflows/ui:tabular-review-modal] failed", error);
                 setWorkflows([]);
             })
             .finally(() => setLoadingWorkflows(false));
 
         if (isProjectMode) {
-            setSelectedDocIds(
-                new Set((fixedProjectDocs ?? []).map((d) => d.id)),
-            );
-            return;
+            const readyProjectDocuments = fixedProjectDocs ?? [];
+            setProjectDocs(readyProjectDocuments);
+            setSelectedDocuments(readyProjectDocuments);
         }
-
-        setLoadingDirectory(true);
-        // /projects only returns counts, not the documents array — fetch
-        // each project in parallel so FileDirectory can render the docs
-        // when the user expands a folder.
-        Promise.all([listStandaloneDocuments(), listProjects()])
-            .then(async ([docs, projs]) => {
-                setStandaloneDocs(
-                    [...docs].sort((a, b) =>
-                        (b.created_at ?? "").localeCompare(a.created_at ?? ""),
-                    ),
-                );
-                const fullProjects = await Promise.all(
-                    projs.map((p) => getProject(p.id)),
-                );
-                setDirectoryProjects(fullProjects);
-            })
-            .catch(() => {
-                setStandaloneDocs([]);
-                setDirectoryProjects([]);
-            })
-            .finally(() => setLoadingDirectory(false));
     }, [open]); // eslint-disable-line react-hooks/exhaustive-deps
+
+    useEffect(() => {
+        if (!open || !profile?.tabularModel) return;
+        const defaultModel = profile.tabularModel;
+        const router = (["openrouter", "vercel", "opencode-go"] as const).find(
+            (slug) => defaultModel.startsWith(`${slug}/`),
+        );
+        const selectedByRouter: Record<RouterSlug, string[]> = {
+            openrouter: profile.openRouterModels,
+            vercel: profile.vercelModels,
+            "opencode-go": profile.openCodeGoModels,
+        };
+        const routerSelectionValid =
+            !router ||
+            selectedByRouter[router].includes(
+                defaultModel.slice(router.length + 1),
+            );
+        const providerAvailable =
+            !apiKeys || isModelAvailable(defaultModel, apiKeys);
+        if (routerSelectionValid && providerAvailable) {
+            setSelectedModel((current) => current || defaultModel);
+        }
+    }, [apiKeys, open, profile]);
 
     if (!open) return null;
 
@@ -145,25 +162,28 @@ export function NewTRModal({
         setTitle("");
         setUnderProject(false);
         setSelectedProjectId("");
+        setSelectedModel("");
+        setNoModelsWarning(null);
         setProjectDocs([]);
-        setStandaloneDocs([]);
-        setDirectoryProjects([]);
-        setSelectedDocIds(new Set());
+        setProjectFolders([]);
+        setExtraStandaloneDocs([]);
+        setSelectedDocuments([]);
+        setGroupBySubfolder(false);
         setSelectedWorkflowId(null);
+        setUploadError(null);
         onClose();
     }
 
     function submitterValue(e: React.FormEvent<HTMLFormElement>) {
         return (
-            (e.nativeEvent as SubmitEvent).submitter as
-                | HTMLButtonElement
-                | null
+            (e.nativeEvent as SubmitEvent).submitter as HTMLButtonElement | null
         )?.value;
     }
 
     function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
         e.preventDefault();
         if (!title.trim()) return;
+        if (!selectedModel) return;
         if (underProject && !selectedProjectId) return;
         if (step === "details" || submitterValue(e) !== "create-review") {
             setStep("documents");
@@ -175,8 +195,12 @@ export function NewTRModal({
         onAdd(
             title.trim(),
             underProject ? selectedProjectId : undefined,
-            selectedDocIds.size > 0 ? [...selectedDocIds] : undefined,
+            selectedDocuments.length > 0
+                ? selectedDocuments.map((document) => document.id)
+                : undefined,
             selectedWorkflow?.columns_config ?? undefined,
+            groupBySubfolder ? "folder" : "document",
+            selectedModel,
         );
         handleClose();
     }
@@ -184,7 +208,8 @@ export function NewTRModal({
     async function handleSelectProject(projectId: string) {
         setSelectedProjectId(projectId);
         setProjectDocs([]);
-        setSelectedDocIds(new Set());
+        setProjectFolders([]);
+        setSelectedDocuments([]);
         setLoadingDocs(true);
         try {
             const proj = await getProject(projectId);
@@ -192,7 +217,8 @@ export function NewTRModal({
                 (d) => d.status === "ready",
             );
             setProjectDocs(docs);
-            setSelectedDocIds(new Set(docs.map((d) => d.id)));
+            setProjectFolders(proj.folders ?? []);
+            setSelectedDocuments(docs);
         } finally {
             setLoadingDocs(false);
         }
@@ -202,24 +228,54 @@ export function NewTRModal({
         const files = Array.from(e.target.files ?? []);
         if (!files.length) return;
         setUploading(true);
+        setUploadError(null);
         try {
-            const uploaded = await Promise.all(
-                files.map((f) =>
-                    underProject && selectedProjectId
-                        ? uploadProjectDocument(selectedProjectId, f)
-                        : uploadStandaloneDocument(f),
-                ),
+            const uploadProjectId = isProjectMode
+                ? projectId
+                : underProject
+                  ? selectedProjectId
+                  : undefined;
+            const outcomes = uploadProjectId
+                ? await uploadProjectDocuments(
+                      uploadProjectId,
+                      files.map((file) => ({ file })),
+                  )
+                : await uploadStandaloneDocuments(
+                      files.map((file) => ({ file })),
+                  );
+            const uploaded = outcomes.flatMap((outcome) =>
+                outcome.status === "completed" && outcome.result
+                    ? [outcome.result]
+                    : [],
             );
-            if (underProject && selectedProjectId) {
+            if (uploadProjectId) {
                 setProjectDocs((prev) => [...uploaded, ...prev]);
             } else {
-                setStandaloneDocs((prev) => [...uploaded, ...prev]);
+                setExtraStandaloneDocs((prev) => [...uploaded, ...prev]);
             }
-            uploaded.forEach((d) =>
-                setSelectedDocIds((prev) => new Set([...prev, d.id])),
-            );
+            setSelectedDocuments((prev) => [
+                ...prev,
+                ...uploaded.filter(
+                    (document) =>
+                        !prev.some((selected) => selected.id === document.id),
+                ),
+            ]);
+            // Files that never became documents cannot be attached to the
+            // review, so say which ones instead of leaving the picker looking
+            // as though the upload simply produced nothing.
+            if (uploaded.length < outcomes.length) {
+                setUploadError(failedUploadMessage(outcomes));
+            }
         } catch (err) {
             console.error("Upload failed:", err);
+            setUploadError(
+                err instanceof UploadBatchError
+                    ? failedUploadMessage(err.outcomes)
+                    : userFacingApiError(
+                          err,
+                          "The selected files could not be uploaded. Please try again.",
+                      ),
+            );
         } finally {
             setUploading(false);
             if (fileInputRef.current) fileInputRef.current.value = "";
@@ -248,23 +304,21 @@ export function NewTRModal({
         : [{ value: "", label: "No projects found" }];
 
     // What to show in the directory depends on mode and toggle state
-    const directoryStandalone = isProjectMode
-        ? (fixedProjectDocs ?? [])
+    const directoryDocuments = isProjectMode
+        ? projectDocs
         : underProject
-          ? []
-          : standaloneDocs;
+          ? projectDocs
+          : extraStandaloneDocs;
     const directoryFolders = isProjectMode
-        ? []
+        ? (fixedProjectFolders ?? [])
         : underProject
-          ? []
-          : directoryProjects;
-    const flatProjectDocs: Document[] =
-        !isProjectMode && underProject ? projectDocs : [];
+          ? projectFolders
+          : [];
     const directoryLoading = isProjectMode
         ? false
         : underProject
           ? loadingDocs
-          : loadingDirectory;
+          : false;
     const showDirectory = isProjectMode || !underProject || !!selectedProjectId;
     const breadcrumbs =
         isProjectMode && projectName
@@ -317,7 +371,8 @@ export function NewTRModal({
                           },
                           disabled:
                               !title.trim() ||
-                              (underProject && !selectedProjectId),
+                              (underProject && !selectedProjectId) ||
+                              !selectedModel,
                       }
                     : {
                           label: "Create",
@@ -327,7 +382,8 @@ export function NewTRModal({
                           value: "create-review",
                           disabled:
                               !title.trim() ||
-                              (underProject && !selectedProjectId),
+                              (underProject && !selectedProjectId) ||
+                              !selectedModel,
                       }
             }
         >
@@ -347,10 +403,10 @@ export function NewTRModal({
                 {step === "details" ? (
                     <div className="space-y-6">
                         <div>
-                            <ModalFieldLabel htmlFor="new-tr-title">
+                            <FieldLabel htmlFor="new-tr-title">
                                 Review name
-                            </ModalFieldLabel>
-                            <ModalTextInput
+                            </FieldLabel>
+                            <FormTextInput
                                 id="new-tr-title"
                                 type="text"
                                 value={title}
@@ -362,11 +418,24 @@ export function NewTRModal({
                             />
                         </div>
 
+                        <div>
+                            <FieldLabel as="p">Model</FieldLabel>
+                            <ModelToggle
+                                value={selectedModel}
+                                onChange={setSelectedModel}
+                                apiKeys={apiKeys}
+                                apiKeysLoading={profileLoading && !profile}
+                                openRouterModels={profile?.openRouterModels}
+                                vercelModels={profile?.vercelModels}
+                                openCodeGoModels={profile?.openCodeGoModels}
+                                onNoModelsClick={setNoModelsWarning}
+                                modalInput
+                            />
+                        </div>
+
                         {/* Workflow template */}
                         <div>
-                            <ModalFieldLabel as="p">
-                                Workflow template
-                            </ModalFieldLabel>
+                            <FieldLabel as="p">Workflow template</FieldLabel>
                             <ModalSelect
                                 id="new-tr-workflow-template"
                                 value={selectedWorkflowId ?? ""}
@@ -381,33 +450,21 @@ export function NewTRModal({
                         {/* Create under a project toggle */}
                         {!isProjectMode && (
                             <div className="space-y-3">
-                                <ModalFieldLabel as="p">
-                                    Project
-                                </ModalFieldLabel>
-                                <button
-                                    type="button"
-                                    onClick={() => {
-                                        const next = !underProject;
+                                <FieldLabel as="p">Project</FieldLabel>
+                                <ToggleSwitch
+                                    checked={underProject}
+                                    onCheckedChange={(next) => {
                                         setUnderProject(next);
                                         if (!next) {
                                             setSelectedProjectId("");
                                             setProjectDocs([]);
-                                            setSelectedDocIds(new Set());
+                                            setProjectFolders([]);
+                                            setSelectedDocuments([]);
                                         }
                                     }}
-                                    className="flex w-fit items-center gap-2.5"
                                 >
-                                    <span
-                                        className={`relative inline-flex h-5 w-9 shrink-0 rounded-full transition-colors duration-200 ${underProject ? "bg-gray-900" : "bg-gray-100"}`}
-                                    >
-                                        <span
-                                            className={`absolute left-0.5 top-0.5 h-4 w-4 rounded-full bg-white shadow-sm transition-transform duration-200 ${underProject ? "translate-x-4" : "translate-x-0"}`}
-                                        />
-                                    </span>
-                                    <span className="text-sm text-gray-600">
-                                        Create under a project
-                                    </span>
-                                </button>
+                                    Create under a project
+                                </ToggleSwitch>
 
                                 {underProject && (
                                     <ModalSelect
@@ -425,41 +482,46 @@ export function NewTRModal({
                                 )}
                             </div>
                         )}
+
+                        <div>
+                            <FieldLabel as="p">Document grouping</FieldLabel>
+                            <ToggleSwitch
+                                checked={groupBySubfolder}
+                                onCheckedChange={setGroupBySubfolder}
+                            >
+                                Treat documents in the same folder as one review
+                                row
+                            </ToggleSwitch>
+                        </div>
                     </div>
                 ) : (
                     <div className="flex min-h-0 flex-1 flex-col">
                         {showDirectory && (
                             <FileDirectory
-                                standaloneDocs={
-                                    isProjectMode
-                                        ? directoryStandalone
-                                        : underProject
-                                          ? flatProjectDocs
-                                          : directoryStandalone
-                                }
-                                directoryProjects={
-                                    isProjectMode
-                                        ? []
-                                        : underProject
-                                          ? []
-                                          : directoryFolders
-                                }
+                                documents={directoryDocuments}
+                                folders={directoryFolders}
                                 loading={directoryLoading}
-                                selectedIds={selectedDocIds}
-                                onChange={setSelectedDocIds}
-                                emptyMessage={
-                                    isProjectMode || underProject
-                                        ? "No ready documents in this project"
-                                        : "No documents yet"
-                                }
-                                searchable
-                                searchAutoFocus
-                                showProjectTabs={!isProjectMode && !underProject}
+                                selectedDocuments={selectedDocuments}
+                                onChange={setSelectedDocuments}
+                                showTabs={!isProjectMode && !underProject}
+                                tabs={TABULAR_DIRECTORY_TABS}
                             />
+                        )}
+                        {uploadError && (
+                            <p
+                                role="alert"
+                                className="mt-3 text-sm text-red-500"
+                            >
+                                {uploadError}
+                            </p>
                         )}
                     </div>
                 )}
             </form>
+            <NoModelsWarningPopup
+                reason={noModelsWarning}
+                onClose={() => setNoModelsWarning(null)}
+            />
         </Modal>
     );
 }

@@ -1,9 +1,13 @@
 import type { AssistantEvent } from "../../shared/types";
 
 export function eventErrorMessage(event: AssistantEvent): string | null {
-    if (event.type === "error") return event.message;
+    if (event.type === "error") {
+        return event.safe_to_display
+            ? event.message
+            : "Sorry, something went wrong.";
+    }
     if ("error" in event && typeof event.error === "string" && event.error) {
-        return event.error;
+        return "Sorry, something went wrong.";
     }
     return null;
 }
@@ -18,7 +22,7 @@ export function toolCallLabel(name: string): string {
     if (name === "fetch_documents") return "Reading documents...";
     if (name === "find_in_document") return "Searching document...";
     if (name === "replicate_document") return "Copying document...";
-    if (name === "read_workflow") return "Loading workflow...";
+    if (name === "read_workflow") return "Reading workflow...";
     if (name === "list_workflows") return "Loading workflows...";
     if (name === "list_documents") return "Loading documents...";
     if (name === "courtlistener_search_case_law")

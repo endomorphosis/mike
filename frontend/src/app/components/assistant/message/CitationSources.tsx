@@ -1,8 +1,15 @@
-import { Loader2, Scale } from "lucide-react";
+import Image from "next/image";
+import { Loader2 } from "lucide-react";
 import { FileTypeIcon } from "../../shared/FileTypeIcon";
 import { displayCitationQuote, formatCitationPage } from "../../shared/types";
 import type { Citation } from "../../shared/types";
-import { RESPONSE_GLASS_ANNOTATION, RESPONSE_GLASS_SURFACE } from "./messageStyles";
+import { CitationPillUI } from "@/shared/ui/CitationPillUI";
+import { RESPONSE_GLASS_SURFACE } from "./messageStyles";
+import {
+    citationVerificationAriaLabel,
+    citationVerificationDescription,
+    citationVerificationPillClassName,
+} from "./citationVerification";
 
 type CitationSourceRow = {
     key: string;
@@ -31,25 +38,30 @@ function citationSourceLabel(annotation: Citation): string {
 export function citationTooltip(annotation: Citation): string {
     const locator = formatCitationPage(annotation);
     const quote = displayCitationQuote(annotation);
-    return locator ? `${locator}: "${quote}"` : `"${quote}"`;
+    const source = locator ? `${locator}: "${quote}"` : `"${quote}"`;
+    const verification = citationVerificationDescription(annotation);
+    return verification ? `${source} — ${verification}` : source;
 }
 
-function CitationSourceIcon({
-    annotation,
-}: {
-    annotation: Citation;
-}) {
+function CitationSourceIcon({ annotation }: { annotation: Citation }) {
     if (annotation.kind === "case") {
-        return <Scale className="h-3.5 w-3.5 text-slate-600" />;
+        return (
+            <Image
+                src="/icons/legal-sources/case-law.svg"
+                alt=""
+                aria-hidden="true"
+                width={14}
+                height={14}
+                className="h-3.5 w-3.5 shrink-0"
+            />
+        );
     }
     return (
         <FileTypeIcon fileType={annotation.filename} className="h-3.5 w-3.5" />
     );
 }
 
-function buildCitationSourceRows(
-    citations: Citation[],
-): CitationSourceRow[] {
+function buildCitationSourceRows(citations: Citation[]): CitationSourceRow[] {
     const rows = new Map<string, CitationSourceRow>();
     citations.forEach((annotation, index) => {
         const key = citationSourceKey(annotation);
@@ -122,6 +134,7 @@ export function buildCitationAppendix(citations: Citation[]) {
 
 export function CitationsBlock({
     citations,
+    activeCitation,
     onCitationClick,
     onOpenSource,
     canOpenSource,
@@ -129,6 +142,7 @@ export function CitationsBlock({
     isLoading = false,
 }: {
     citations: Citation[];
+    activeCitation?: Citation | null;
     onCitationClick?: (citation: Citation) => void;
     onOpenSource?: (citation: Citation) => void;
     canOpenSource?: (citation: Citation) => boolean;
@@ -175,23 +189,29 @@ export function CitationsBlock({
                                 <div className="flex shrink-0 flex-wrap justify-end gap-1">
                                     {row.entries.map(
                                         ({ annotation, index }) => (
-                                            <button
+                                            <CitationPillUI
                                                 key={`${row.key}:${index}`}
-                                                type="button"
+                                                active={
+                                                    activeCitation ===
+                                                    annotation
+                                                }
                                                 onClick={() =>
                                                     onCitationClick?.(
                                                         annotation,
                                                     )
                                                 }
-                                                className={
-                                                    RESPONSE_GLASS_ANNOTATION
-                                                }
+                                                className={citationVerificationPillClassName(
+                                                    annotation,
+                                                )}
+                                                aria-label={citationVerificationAriaLabel(
+                                                    annotation,
+                                                )}
                                                 title={citationTooltip(
                                                     annotation,
                                                 )}
                                             >
                                                 {annotation.ref}
-                                            </button>
+                                            </CitationPillUI>
                                         ),
                                     )}
                                 </div>
@@ -203,4 +223,3 @@ export function CitationsBlock({
         </div>
     );
 }
-

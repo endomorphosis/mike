@@ -1,0 +1,320 @@
+/// <reference types="office-js" />
+import { describeNetworkFailure } from "../lib/networkError";
+import { parseGoogleOAuthDialogMessage } from "./oauthProtocol";
+
+const LEGACY_ACCESS_KEY = "mike_token";
+const LEGACY_REFRESH_KEY = "mike_refresh_token";
+const API_BASE = (process.env.REACT_APP_API_BASE_URL || "/api").replace(
+  /\/+$/,
+  "",
+);
+
+export interface AddinAuthUser {
+  id: string;
+  email: string;
+  pendingEmail: string | null;
+  createdWithGoogle: boolean;
+}
+
+interface SessionState {
+  user: AddinAuthUser | null;
+  loading: boolean;
+  error: string | null;
+}
+
+let _user: AddinAuthUser | null = null;
+let _loading = true;
+let _error: string | null = null;
+let _initialized = false;
+let _sessionGeneration = 0;
+let _sessionPromise: Promise<AddinAuthUser | null> | null = null;
+const _subscribers = new Set<() => void>();
+
+function broadcast(): void {
+  _subscribers.forEach((subscriber) => subscriber());
+}
+
+export function subscribe(fn: () => void): () => void {
+  _subscribers.add(fn);
+  return () => _subscribers.delete(fn);
+}
+
+export function getSessionState(): SessionState {
+  return { user: _user, loading: _loading, error: _error };
+}
+
+async function clearLegacyTokenStorage(): Promise<void> {
+  await Promise.all([
+    OfficeRuntime.storage.removeItem(LEGACY_ACCESS_KEY).catch(() => {}),
+    OfficeRuntime.storage.removeItem(LEGACY_REFRESH_KEY).catch(() => {}),
+  ]);
+}
+
+async function parseError(response: Response): Promise<string> {
+  const body = (await response.json().catch(() => ({}))) as {
+    detail?: unknown;
+  };
+  return typeof body.detail === "string" && body.detail
+    ? `${body.detail} (HTTP ${response.status}).`
+    : `Authentication failed (HTTP ${response.status}).`;
+}
+
+async function requestSession(): Promise<AddinAuthUser | null> {
+  const url = `${API_BASE}/auth/session`;
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      credentials: "include",
+      cache: "no-store",
+    });
+  } catch (error) {
+    throw new Error(describeNetworkFailure(error, { method: "GET", url }), {
+      cause: error,
+    });
+  }
+  if (response.status === 401) return null;
+  if (!response.ok) throw new Error(await parseError(response));
+  const body = (await response.json()) as { user: AddinAuthUser };
+  return body.user;
+}
+
+async function redeemAuthHandoff(
+  ticket: string,
+  requestId: string,
+): Promise<AddinAuthUser> {
+  const url = `${API_BASE}/auth/handoff`;
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ticket, requestId }),
+    });
+  } catch (error) {
+    throw new Error(describeNetworkFailure(error, { method: "POST", url }), {
+      cause: error,
+    });
+  }
+  if (!response.ok) throw new Error(await parseError(response));
+  const body = (await response.json()) as { user: AddinAuthUser };
+  return body.user;
+}
+
+export function refreshSession(): Promise<AddinAuthUser | null> {
+  if (!_sessionPromise) {
+    _sessionPromise = requestSession().finally(() => {
+      _sessionPromise = null;
+    });
+  }
+  return _sessionPromise.then((user) => {
+    _user = user;
+    _error = null;
+    broadcast();
+    return user;
+  });
+}
+
+export function initialize(): void {
+  if (_initialized) return;
+  _initialized = true;
+  void clearLegacyTokenStorage()
+    .then(() => refreshSession())
+    .catch((error: unknown) => {
+      _user = null;
+      _error = error instanceof Error ? error.message : "Login failed";
+    })
+    .finally(() => {
+      _loading = false;
+      broadcast();
+    });
+}
+
+export async function signIn(email: string, password: string): Promise<void> {
+  const generation = ++_sessionGeneration;
+  _loading = true;
+  _error = null;
+  broadcast();
+  const url = `${API_BASE}/auth/login`;
+
+  try {
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, password }),
+      });
+    } catch (error) {
+      throw new Error(describeNetworkFailure(error, { method: "POST", url }), {
+        cause: error,
+      });
+    }
+    if (!response.ok) throw new Error(await parseError(response));
+    const body = (await response.json()) as { user: AddinAuthUser };
+    if (generation !== _sessionGeneration) return;
+    _user = body.user;
+  } catch (error) {
+    if (generation !== _sessionGeneration) return;
+    _user = null;
+    _error = error instanceof Error ? error.message : "Login failed";
+  } finally {
+    if (generation === _sessionGeneration) {
+      _loading = false;
+      broadcast();
+    }
+  }
+}
+
+function createOAuthRequestId(): string {
+  if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(
+    "",
+  );
+}
+
+export async function signInWithGoogle(): Promise<void> {
+  const generation = ++_sessionGeneration;
+  const requestId = createOAuthRequestId();
+  const expectedOrigin = window.location.origin;
+  const dialogUrl = new URL("/oauth-dialog.html", expectedOrigin);
+  dialogUrl.searchParams.set("requestId", requestId);
+  _loading = true;
+  _error = null;
+  broadcast();
+
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    const fail = (message: string): void => {
+      if (settled) return;
+      settled = true;
+      if (generation === _sessionGeneration) {
+        _error = message;
+        broadcast();
+      }
+      resolve();
+    };
+
+    try {
+      Office.context.ui.displayDialogAsync(
+        dialogUrl.toString(),
+        { height: 60, width: 45, displayInIframe: false },
+        (result) => {
+          if (result.status !== Office.AsyncResultStatus.Succeeded) {
+            fail(result.error?.message ?? "Unable to open Google sign-in.");
+            return;
+          }
+          const dialog = result.value;
+          const close = (): void => {
+            try {
+              dialog.close();
+            } catch {
+              // The host may already have closed the dialog.
+            }
+          };
+
+          dialog.addEventHandler(
+            Office.EventType.DialogMessageReceived,
+            (event) => {
+              if (settled || !("message" in event)) return;
+              if (event.origin && event.origin !== expectedOrigin) {
+                close();
+                fail("Google sign-in returned from an unexpected origin.");
+                return;
+              }
+              const message = parseGoogleOAuthDialogMessage(event.message);
+              if (!message || message.requestId !== requestId) {
+                close();
+                fail("Google sign-in returned an invalid response.");
+                return;
+              }
+              if (message.status === "error") {
+                close();
+                fail(message.message);
+                return;
+              }
+
+              settled = true;
+              close();
+              void redeemAuthHandoff(message.handoffTicket, requestId)
+                .then((user) => {
+                  if (generation === _sessionGeneration) {
+                    _user = user;
+                    _error = null;
+                  }
+                })
+                .catch((error: unknown) => {
+                  if (generation === _sessionGeneration) {
+                    _error =
+                      error instanceof Error
+                        ? error.message
+                        : "Unable to complete Google sign-in.";
+                  }
+                })
+                .finally(() => {
+                  if (generation === _sessionGeneration) _loading = false;
+                  broadcast();
+                  resolve();
+                });
+            },
+          );
+
+          dialog.addEventHandler(
+            Office.EventType.DialogEventReceived,
+            (event) => {
+              if (!("error" in event)) return;
+              fail(
+                event.error === 12006
+                  ? "Google sign-in was cancelled."
+                  : `Google sign-in closed unexpectedly (Office error ${event.error}).`,
+              );
+            },
+          );
+        },
+      );
+    } catch (error) {
+      fail(
+        error instanceof Error
+          ? error.message
+          : "Unable to open Google sign-in.",
+      );
+    }
+  }).finally(() => {
+    if (generation === _sessionGeneration && _loading) {
+      _loading = false;
+      broadcast();
+    }
+  });
+}
+
+export async function signOut(): Promise<void> {
+  _sessionGeneration += 1;
+  _error = null;
+  const url = `${API_BASE}/auth/logout`;
+  try {
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ scope: "local" }),
+      });
+    } catch (error) {
+      throw new Error(describeNetworkFailure(error, { method: "POST", url }), {
+        cause: error,
+      });
+    }
+    if (!response.ok) throw new Error(await parseError(response));
+    _user = null;
+    await clearLegacyTokenStorage();
+  } catch (error) {
+    _error =
+      error instanceof Error
+        ? error.message
+        : "Unable to sign out. Please try again.";
+  }
+  broadcast();
+}

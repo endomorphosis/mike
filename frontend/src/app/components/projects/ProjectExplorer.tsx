@@ -2,11 +2,8 @@
 
 import { useEffect, useRef, useState } from "react";
 import {
-    Folder,
-    FolderOpen,
     ChevronRight,
     ChevronDown,
-    FolderPlus,
     Trash2,
 } from "lucide-react";
 import type {
@@ -15,6 +12,11 @@ import type {
 } from "@/app/components/shared/types";
 import { VersionChip } from "@/app/components/shared/VersionChip";
 import { FileTypeIcon } from "@/app/components/shared/FileTypeIcon";
+import {
+    ProjectSvgIcon,
+    SubfolderSvgIcon,
+} from "@/app/components/shared/FolderSvgIcon";
+import { LIQUID_GLASS_FLOAT_CLASS } from "@/shared/ui/LiquidGlassUI";
 
 interface Props {
     projectName?: string | null;
@@ -91,7 +93,11 @@ export function ProjectExplorer({
     function toggleFolder(id: string) {
         setExpandedIds((prev) => {
             const next = new Set(prev);
-            next.has(id) ? next.delete(id) : next.add(id);
+            if (next.has(id)) {
+                next.delete(id);
+            } else {
+                next.add(id);
+            }
             return next;
         });
     }
@@ -162,7 +168,7 @@ export function ProjectExplorer({
     }
 
     function renderLevel(parentId: string | null, depth: number): React.ReactNode {
-        const basePadding = 28 + (depth - 1) * 16; // pl-7 at depth 1, +16px per level
+        const basePadding = 24 + (depth - 1) * 16;
         const childFolders = folders
             .filter((f) => f.parent_folder_id === parentId)
             .sort((a, b) => a.name.localeCompare(b.name));
@@ -177,7 +183,7 @@ export function ProjectExplorer({
                         style={{ paddingLeft: basePadding }}
                     >
                         <ChevronRight className="h-3 w-3 text-gray-300 shrink-0" />
-                        <FolderPlus className="h-3.5 w-3.5 text-amber-400 shrink-0" />
+                        <SubfolderSvgIcon className="h-3.5 w-3.5 shrink-0" />
                         <input
                             ref={newFolderInputRef}
                             autoFocus
@@ -230,7 +236,7 @@ export function ProjectExplorer({
                                 className={`flex items-center gap-1.5 py-1.5 pr-2 rounded-sm cursor-pointer select-none transition-colors group ${
                                     isDragTarget
                                         ? "bg-blue-50 ring-1 ring-inset ring-blue-200"
-                                        : "hover:bg-gray-50"
+                                        : "theme-dropdown-item"
                                 }`}
                                 style={{ paddingLeft: basePadding }}
                                 onClick={() => toggleFolder(folder.id)}
@@ -242,10 +248,10 @@ export function ProjectExplorer({
                                     ? <ChevronDown className="h-3 w-3 text-gray-400 shrink-0" />
                                     : <ChevronRight className="h-3 w-3 text-gray-400 shrink-0" />
                                 }
-                                {isExpanded
-                                    ? <FolderOpen className="h-3.5 w-3.5 text-amber-500 shrink-0" />
-                                    : <Folder className="h-3.5 w-3.5 text-amber-500 shrink-0" />
-                                }
+                                <SubfolderSvgIcon
+                                    open={isExpanded}
+                                    className="h-3.5 w-3.5 shrink-0"
+                                />
                                 {isRenaming ? (
                                     <input
                                         autoFocus
@@ -292,7 +298,7 @@ export function ProjectExplorer({
                                 )
                             }
                             className={`flex items-center gap-2 py-1.5 pr-4 rounded-sm cursor-pointer select-none transition-colors ${
-                                isSelected ? "bg-gray-100 text-gray-900" : "text-gray-600 hover:bg-gray-50 hover:text-gray-900"
+                                isSelected ? "theme-dropdown-selected text-gray-900" : "theme-dropdown-item text-gray-600 hover:text-gray-900"
                             }`}
                             style={{ paddingLeft: basePadding }}
                         >
@@ -346,7 +352,7 @@ export function ProjectExplorer({
                     className="flex items-center gap-2 px-2 py-1.5 select-none"
                     onContextMenu={(e) => { e.stopPropagation(); openContextMenu(e, null); }}
                 >
-                    <FolderOpen className="h-3.5 w-3.5 text-gray-400 shrink-0" />
+                    <ProjectSvgIcon open className="h-3.5 w-3.5 shrink-0" />
                     <span className="text-xs text-gray-500 truncate">{projectName}</span>
                 </li>
             )}
@@ -365,12 +371,12 @@ export function ProjectExplorer({
             {contextMenu && (
                 <div
                     ref={contextMenuRef}
-                    className="fixed z-50 w-44 rounded-lg border border-gray-100 bg-white shadow-lg overflow-hidden text-xs"
+                    className={`fixed z-50 w-44 overflow-hidden rounded-lg text-xs ${LIQUID_GLASS_FLOAT_CLASS} backdrop-blur-2xl`}
                     style={{ top: contextMenu.y, left: contextMenu.x }}
                 >
                     {onCreateFolder && (
                         <button
-                            className="w-full px-3 py-1.5 text-left text-gray-700 hover:bg-gray-50 flex items-center gap-2"
+                            className="theme-dropdown-item flex w-full items-center gap-2 px-3 py-1.5 text-left text-gray-700"
                             onClick={() => {
                                 setContextMenu(null);
                                 if (contextMenu.parentId) {
@@ -382,13 +388,13 @@ export function ProjectExplorer({
                                 setNewFolderName("");
                             }}
                         >
-                            <FolderPlus className="h-3.5 w-3.5 text-gray-400" />
+                            <SubfolderSvgIcon className="h-3.5 w-3.5 shrink-0" />
                             New subfolder
                         </button>
                     )}
                     {contextMenu.folderId && onRenameFolder && (
                         <button
-                            className="w-full px-3 py-1.5 text-left text-gray-700 hover:bg-gray-50"
+                            className="theme-dropdown-item w-full px-3 py-1.5 text-left text-gray-700"
                             onClick={() => {
                                 const f = folders.find((x) => x.id === contextMenu.folderId);
                                 setRenameValue(f?.name ?? "");

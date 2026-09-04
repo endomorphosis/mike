@@ -4,16 +4,26 @@ import remarkMath from "remark-math";
 import remarkGfm from "remark-gfm";
 import rehypeKatex from "rehype-katex";
 import "katex/dist/katex.min.css";
-import type { AssistantEvent, Citation } from "../../shared/types";
-import { RESPONSE_GLASS_ANNOTATION, withoutMarkdownNode } from "./messageStyles";
+import type {
+    AssistantEvent,
+    Citation,
+    PanelDocument,
+} from "../../shared/types";
+import { CitationPillUI } from "@/shared/ui/CitationPillUI";
+import { withoutMarkdownNode } from "./messageStyles";
 import { citationTooltip } from "./CitationSources";
+import {
+    citationVerificationAriaLabel,
+    citationVerificationPillClassName,
+} from "./citationVerification";
 import { internalCaseHref } from "./citationUtils";
 
 export function MarkdownContent({
     text,
     inlineCitationTargets,
     caseCitations,
-    caseOpinions,
+    caseDocuments,
+    activeCitation,
     onCitationClick,
     onCaseClick,
     divRef,
@@ -24,10 +34,8 @@ export function MarkdownContent({
         string,
         Extract<AssistantEvent, { type: "case_citation" }>
     >;
-    caseOpinions: Map<
-        number,
-        Extract<AssistantEvent, { type: "case_opinions" }>["case"]
-    >;
+    caseDocuments: Map<number, PanelDocument>;
+    activeCitation?: Citation | null;
     onCitationClick?: (c: Citation) => void;
     onCaseClick?: (
         c: Extract<AssistantEvent, { type: "case_citation" }>,
@@ -110,6 +118,18 @@ export function MarkdownContent({
                             {...withoutMarkdownNode(props)}
                         />
                     ),
+                    h5: (props) => (
+                        <h5
+                            className="text-base font-semibold mt-3 mb-2"
+                            {...withoutMarkdownNode(props)}
+                        />
+                    ),
+                    h6: (props) => (
+                        <h6
+                            className="text-sm font-semibold mt-3 mb-2"
+                            {...withoutMarkdownNode(props)}
+                        />
+                    ),
                     p: ({ node, ...props }) => {
                         const parent =
                             node && typeof node === "object" && "parent" in node
@@ -151,7 +171,10 @@ export function MarkdownContent({
                         />
                     ),
                     em: (props) => (
-                        <em className="italic" {...withoutMarkdownNode(props)} />
+                        <em
+                            className="italic"
+                            {...withoutMarkdownNode(props)}
+                        />
                     ),
                     code: (props) => {
                         const { children, ...codeProps } =
@@ -164,16 +187,20 @@ export function MarkdownContent({
                             if (annotation) {
                                 const tooltipText = citationTooltip(annotation);
                                 return (
-                                    <button
+                                    <CitationPillUI
+                                        active={activeCitation === annotation}
                                         onClick={() =>
                                             onCitationClick?.(annotation)
                                         }
                                         data-citation-ref={annotation.ref}
-                                        className={`${RESPONSE_GLASS_ANNOTATION} mx-0.5 align-super`}
+                                        className={`${citationVerificationPillClassName(annotation)} mx-0.5 align-super`}
+                                        aria-label={citationVerificationAriaLabel(
+                                            annotation,
+                                        )}
                                         title={tooltipText}
                                     >
                                         {annotation.ref}
-                                    </button>
+                                    </CitationPillUI>
                                 );
                             }
                         }
@@ -205,12 +232,13 @@ export function MarkdownContent({
                                         onClick={() =>
                                             onCaseClick({
                                                 ...citation,
-                                                case:
+                                                document:
                                                     citation.cluster_id !== null
-                                                        ? caseOpinions.get(
+                                                        ? (caseDocuments.get(
                                                               citation.cluster_id,
-                                                          )
-                                                        : undefined,
+                                                          ) ??
+                                                          citation.document)
+                                                        : citation.document,
                                             })
                                         }
                                         className="text-left text-blue-600 hover:text-blue-700 underline"
@@ -275,4 +303,3 @@ export function MarkdownContent({
         </div>
     );
 }
-

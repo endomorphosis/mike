@@ -1,0 +1,21 @@
+{
+  "$schema": "./node_modules/@stryker-mutator/core/schema/stryker-schema.json",
+  "_comment": "Mutation testing for the SECURITY-CRITICAL libs only (access control, download-token signing, citation extraction). These are the modules where a test suite that merely *executes* lines without *asserting* behavior is dangerous, so we pay the mutation-testing cost here and nowhere else. Deliberately NOT a merge gate — run on demand via `npm run test:mutation` or the monthly mutation.yml workflow. Floors only go up: when tests kill more mutants, raise thresholds.break in the same PR. Widen mutate only alongside tests that keep the score above the floor.",
+  "testRunner": "vitest",
+  "mutate": [
+    "src/lib/access.ts",
+    "src/lib/downloadTokens.ts",
+    "src/lib/chat/citations.ts"
+  ],
+  "coverageAnalysis": "perTest",
+  "reporters": ["html", "clear-text", "progress"],
+  "htmlReporter": {
+    "fileName": "reports/mutation/mutation.html"
+  },
+  "thresholds": {
+    "high": 80,
+    "low": 70,
+    "break": 69
+  },
+  "tempDirName": ".stryker-tmp"
+}

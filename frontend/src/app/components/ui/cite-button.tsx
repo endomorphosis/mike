@@ -4,7 +4,7 @@ import { QuoteIcon } from "@radix-ui/react-icons";
 
 interface CiteButtonProps {
     quoteText: string;
-    citationText: string;
+    quoteLabel: string;
     className?: string;
     showText?: boolean;
     iconSize?: number;
@@ -13,7 +13,7 @@ interface CiteButtonProps {
 
 export function CiteButton({
     quoteText,
-    citationText,
+    quoteLabel,
     className = "",
     showText = true,
     iconSize = 12,
@@ -26,8 +26,8 @@ export function CiteButton({
         e.preventDefault();
 
         try {
-            const compiledText =
-                `"${quoteText.replace(/"/g, "'")}" ${citationText}`.trim();
+            const label = quoteLabel ? ` (${quoteLabel})` : "";
+            const compiledText = `"${quoteText.replace(/"/g, "'")}"${label}`;
             await navigator.clipboard.writeText(compiledText);
 
             setIsCopied(true);
@@ -39,8 +39,12 @@ export function CiteButton({
 
     return (
         <button
+            type="button"
             onClick={handleClick}
-            className={`transition-colors flex items-center gap-1 ${className}`}
+            // Only name the button when there is no visible label; overriding a
+            // visible "Cite" with a different name breaks WCAG 2.5.3.
+            aria-label={showText ? undefined : "Copy quote and citation"}
+            className={`transition-colors flex items-center gap-1 rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/40 focus-visible:ring-offset-2 ${className}`}
             title="Copy Quote and Citation"
         >
             {isCopied ? (
@@ -53,6 +57,7 @@ export function CiteButton({
             )}
             {showText && (
                 <span
+                    role="status"
                     className={
                         isCopied
                             ? `text-green-600 ${textClassName}`

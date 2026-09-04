@@ -1,35 +1,26 @@
 "use client";
 
+import Image from "next/image";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Download, Loader2 } from "lucide-react";
-import { supabase } from "@/app/lib/supabase";
+import { Download, ExternalLink, Loader2 } from "lucide-react";
+import { API_BASE } from "@/app/lib/mikeApi";
+import { authenticatedFetch } from "@/app/lib/authEvents";
+import { PillButton } from "@/app/components/ui/pill-button";
 import { PdfView } from "../shared/views/PdfView";
 import { DocxView } from "../shared/views/DocxView";
 import { SpreadsheetView } from "../shared/views/SpreadsheetView";
 import {
-    CitationQuotesHeader,
-    type CitationQuoteHeaderItem,
-} from "./CitationQuotesHeader";
-import { TrackedChangeHeader } from "./TrackedChangeHeader";
-import {
-    cleanCitationQuoteText,
-    expandCitationToEntries,
-    formatCitationPage,
-    formatCitationQuotePage,
-    getDocumentCitationQuotes,
-    isSpreadsheetFilename,
-} from "../shared/types";
-import type {
-    CitationQuote,
-    Citation,
-    DocumentCitation,
-    EditAnnotation,
-} from "../shared/types";
-
-function isDocxFilename(name: string): boolean {
-    const ext = name.split(".").pop()?.toLowerCase();
-    return ext === "docx" || ext === "doc";
-}
+    CitationQuotesSection,
+    documentQuoteId,
+} from "./CitationQuotesSection";
+import { EditCard } from "./EditCard";
+import { expandDocumentQuoteEntry } from "../shared/types";
+import type { Citation, EditAnnotation, PanelDocument } from "../shared/types";
+import { quoteVerificationState } from "./message/citationVerification";
+import { FileTypeIcon } from "../shared/FileTypeIcon";
+import { CaseView } from "./CaseView";
+import { useResolvedPanelDocument } from "./useResolvedPanelDocument";
+import { resolveDocumentViewType } from "@/app/lib/documentViewType";
 
 /**
  * Discriminated-union describing what the panel is showing above the viewer.
@@ -71,82 +62,95 @@ export type DocPanelMode =
       };
 
 interface Props {
-    documentId: string;
-    filename: string;
-    versionId: string | null;
-    versionNumber: number | null;
+    document: PanelDocument;
     mode: DocPanelMode;
-    /** Spinner on the Download button while an accept/reject is in flight. */
     isReloading?: boolean;
+    compactActions?: boolean;
     warning?: string | null;
     onWarningDismiss?: () => void;
     initialScrollTop?: number | null;
     onScrollChange?: (scrollTop: number) => void;
 }
 
-/**
- * Unified side-panel body for the assistant. Renders a single document
- * with optionally a citation quote OR a tracked change highlighted above
- * the viewer. No selector UI — caller picks the one thing to show; if the
- * user wants a different citation/edit, the panel gets a new tab.
- */
+/** One shared panel shell with a document-type-specific body. */
 export function DocPanel({
-    documentId,
-    filename,
-    versionId,
-    versionNumber,
+    document,
     mode,
     isReloading = false,
+    compactActions = false,
     warning,
     onWarningDismiss,
     initialScrollTop,
     onScrollChange,
 }: Props) {
-    // Pick the viewer from the filename only, not from mode. Switching
-    // headers (citation ↔ edit ↔ document) for the same document must
-    // not unmount and remount the body — otherwise the user sees a full
-    // re-fetch every time they toggle. Tracked-change rendering still
-    // only lives in DocxView, which is fine because edits are DOCX-only.
-    const useDocxView = isDocxFilename(filename);
-    const useSheetView = isSpreadsheetFilename(filename);
+    const {
+        document: resolvedDocument,
+        isLoading: isDocumentLoading,
+        error: documentError,
+        retry: retryDocument,
+    } = useResolvedPanelDocument(document);
+
+    const documentId = resolvedDocument.document_id;
+    const versionId = resolvedDocument.version_id ?? null;
+    const isCase = resolvedDocument.type === "case";
+    const viewType = resolveDocumentViewType({
+        filename: resolvedDocument.title,
+        fileType: resolvedDocument.type,
+    });
+    const firstSelectableQuoteIndex =
+        mode.kind === "citation"
+            ? resolvedDocument.quotes.findIndex(
+                  (quote) => quoteVerificationState(quote) !== "unverified",
+              )
+            : -1;
     const citationQuoteId =
-        mode.kind === "citation" ? `document:${mode.citation.ref}:0` : null;
+        firstSelectableQuoteIndex >= 0
+            ? documentQuoteId(documentId, firstSelectableQuoteIndex)
+            : null;
     const [activeCitationQuoteId, setActiveCitationQuoteId] = useState<
         string | null
     >(citationQuoteId);
     const [quoteFocusKey, setQuoteFocusKey] = useState(0);
     const [editFocusKey, setEditFocusKey] = useState(0);
 
-    const quotes: CitationQuote[] | undefined = useMemo(() => {
-        if (mode.kind !== "citation") return undefined;
-        if (!activeCitationQuoteId) return [];
-        const selectedIndex = Number(activeCitationQuoteId.split(":").at(-1));
-        if (!Number.isFinite(selectedIndex)) return [];
-        const selectedQuote =
-            getDocumentCitationQuotes(mode.citation)[selectedIndex];
-        if (!selectedQuote) return [];
-        const documentCitation = mode.citation as DocumentCitation;
-        return expandCitationToEntries({
-            ...documentCitation,
-            page: selectedQuote.page,
-            quote: selectedQuote.quote,
-            quotes: [selectedQuote],
-        });
-    }, [activeCitationQuoteId, citationQuoteId, mode]);
+    const activeQuoteIndex = activeCitationQuoteId
+        ? Number(activeCitationQuoteId.split(":quote:").at(-1))
+        : Number.NaN;
+    const activeDocumentQuote = Number.isFinite(activeQuoteIndex)
+        ? resolvedDocument.quotes[activeQuoteIndex]
+        : undefined;
 
-    // Cell locator(s) for the selected quote, used to highlight the cited cell
-    // when the document is a spreadsheet.
-    const highlightCells = useMemo(() => {
-        if (mode.kind !== "citation") return undefined;
-        if (!activeCitationQuoteId) return [];
-        const selectedIndex = Number(activeCitationQuoteId.split(":").at(-1));
-        if (!Number.isFinite(selectedIndex)) return [];
-        const selectedQuote =
-            getDocumentCitationQuotes(mode.citation)[selectedIndex];
-        if (!selectedQuote || (!selectedQuote.cell && !selectedQuote.sheet))
-            return [];
-        return [{ sheet: selectedQuote.sheet, cell: selectedQuote.cell }];
-    }, [activeCitationQuoteId, mode]);
+    const { activeViewerQuotes, activeHighlightCells } = useMemo(() => {
+        if (mode.kind !== "citation" || isCase) {
+            return {
+                activeViewerQuotes: undefined,
+                activeHighlightCells: undefined,
+            };
+        }
+        if (!activeDocumentQuote) {
+            return {
+                activeViewerQuotes: [],
+                activeHighlightCells: [],
+            };
+        }
+
+        return {
+            activeViewerQuotes: expandDocumentQuoteEntry({
+                page: activeDocumentQuote.target.page,
+                quote: activeDocumentQuote.quote,
+            }),
+            activeHighlightCells:
+                activeDocumentQuote.target.cell ||
+                activeDocumentQuote.target.sheet
+                    ? [
+                          {
+                              sheet: activeDocumentQuote.target.sheet,
+                              cell: activeDocumentQuote.target.cell,
+                          },
+                      ]
+                    : [],
+        };
+    }, [activeDocumentQuote, isCase, mode.kind]);
 
     useEffect(() => {
         setActiveCitationQuoteId(citationQuoteId);
@@ -175,40 +179,62 @@ export function DocPanel({
     return (
         <div className="flex h-full flex-col">
             <DocumentTitleRow
-                documentId={documentId}
-                filename={filename}
-                versionId={versionId}
-                versionNumber={versionNumber}
+                document={resolvedDocument}
                 isReloading={isReloading}
+                compactActions={compactActions}
             />
 
             {mode.kind === "citation" && (
-                <RelevantQuoteSection
-                    citation={mode.citation}
-                    filename={filename}
+                <CitationQuotesSection
+                    document={resolvedDocument}
                     activeQuoteId={activeCitationQuoteId}
-                    onQuoteSelect={handleCitationQuoteSelect}
+                    citationRef={mode.citation.ref}
+                    onSelect={(quote) => {
+                        if (quote.verificationState !== "unverified") {
+                            handleCitationQuoteSelect(quote.id);
+                        }
+                    }}
+                    onIndexChange={(index) => {
+                        handleCitationQuoteSelect(
+                            documentQuoteId(documentId, index),
+                        );
+                    }}
                 />
             )}
 
-            {mode.kind === "edit" && (
-                <TrackedChangeHeader
-                    edit={mode.edit}
-                    changeNumber={mode.changeNumber}
-                    isEditReloading={mode.isEditReloading}
-                    onResolveStart={mode.onResolveStart}
-                    onResolved={mode.onResolved}
-                    onError={mode.onError}
-                    onHighlight={() => setEditFocusKey((current) => current + 1)}
-                />
+            {mode.kind === "edit" && !isCase && (
+                <div className="px-2 pb-2">
+                    <EditCard
+                        annotation={mode.edit}
+                        changeNumber={mode.changeNumber}
+                        isReloading={mode.isEditReloading}
+                        onResolveStart={mode.onResolveStart}
+                        onResolved={mode.onResolved}
+                        onError={mode.onError}
+                        onViewClick={() =>
+                            setEditFocusKey((current) => current + 1)
+                        }
+                    />
+                </div>
             )}
 
-            <div className="flex flex-1 min-h-0 flex-col px-3 py-3">
-                {useDocxView ? (
+            <div className="flex flex-1 min-h-0 flex-col">
+                {isCase ? (
+                    <CaseView
+                        document={resolvedDocument}
+                        activeQuote={activeDocumentQuote}
+                        quoteFocusKey={quoteFocusKey}
+                        isLoading={isDocumentLoading}
+                        error={documentError}
+                        onRetry={retryDocument}
+                        onClearQuote={() => setActiveCitationQuoteId(null)}
+                    />
+                ) : viewType === "docx" ? (
                     <DocxView
                         documentId={documentId}
                         versionId={versionId ?? undefined}
-                        quotes={quotes}
+                        rounded={false}
+                        quotes={activeViewerQuotes}
                         quoteFocusKey={quoteFocusKey}
                         highlightEdit={highlightEdit}
                         warning={warning ?? null}
@@ -216,11 +242,12 @@ export function DocPanel({
                         initialScrollTop={initialScrollTop ?? null}
                         onScrollChange={onScrollChange}
                     />
-                ) : useSheetView ? (
+                ) : viewType === "spreadsheet" ? (
                     <SpreadsheetView
                         documentId={documentId}
                         versionId={versionId}
-                        highlightCells={highlightCells}
+                        rounded={false}
+                        highlightCells={activeHighlightCells}
                     />
                 ) : (
                     <PdfView
@@ -228,7 +255,8 @@ export function DocPanel({
                             document_id: documentId,
                             version_id: versionId,
                         }}
-                        quotes={quotes}
+                        rounded={false}
+                        quotes={activeViewerQuotes}
                         quoteFocusKey={quoteFocusKey}
                     />
                 )}
@@ -237,116 +265,201 @@ export function DocPanel({
     );
 }
 
-// ---------------------------------------------------------------------------
-// Header variants
-// ---------------------------------------------------------------------------
+type ExternalSourceLink = {
+    href: string;
+    label: string;
+    title: string;
+};
 
-function DocumentTitleRow({
-    documentId,
-    filename,
-    versionId,
-    versionNumber,
+export function DocumentTitleRow({
+    document,
     isReloading,
+    compactActions,
 }: {
-    documentId: string;
-    filename: string;
-    versionId: string | null;
-    versionNumber: number | null;
+    document: PanelDocument;
     isReloading: boolean;
+    compactActions: boolean;
 }) {
+    const isFile =
+        document.type === "docx" ||
+        document.type === "pdf" ||
+        document.type === "spreadsheet";
+    const versionNumber = document.version_number;
+
     return (
-        <div className="flex items-start gap-3 px-3 pt-4 pb-3">
-            <div className="min-w-0 flex-1">
-                <div className="flex min-w-0 flex-wrap items-center gap-2">
-                    <h2
-                        className="min-w-0 break-words font-serif text-xl text-gray-900"
-                        title={filename}
-                    >
-                        {filename}
-                    </h2>
-                    {versionNumber && versionNumber > 0 && (
-                        <span className="shrink-0 inline-flex items-center rounded-md border border-gray-200 bg-white px-1.5 py-0.5 text-[10px] font-medium text-gray-600">
-                            V{versionNumber}
-                        </span>
+        <div className="px-3 py-2">
+            <div className="flex items-start gap-3">
+                <div className="flex min-w-0 flex-1 items-start gap-2">
+                    <span className="mt-0.5 shrink-0">
+                        {document.type === "case" ||
+                        document.type === "legislation" ? (
+                            <Image
+                                src={
+                                    document.type === "case"
+                                        ? "/icons/legal-sources/case-law.svg"
+                                        : "/icons/legal-sources/legislation.svg"
+                                }
+                                alt=""
+                                aria-hidden="true"
+                                width={16}
+                                height={16}
+                                className="h-4 w-4 shrink-0 object-contain"
+                            />
+                        ) : (
+                            <FileTypeIcon
+                                fileType={document.title}
+                                className="h-4 w-4"
+                            />
+                        )}
+                    </span>
+                    <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+                        <h2
+                            className="min-w-0 break-words text-sm font-medium text-gray-800"
+                            title={document.title}
+                        >
+                            {document.title}
+                        </h2>
+                        {versionNumber && versionNumber > 0 ? (
+                            <span className="inline-flex shrink-0 items-center rounded-md border border-gray-200 bg-white px-1.5 py-0.5 text-[10px] font-medium text-gray-600">
+                                V{versionNumber}
+                            </span>
+                        ) : null}
+                    </div>
+                </div>
+                <div className="flex min-w-0 shrink-0 flex-wrap items-center justify-end gap-2">
+                    {isFile && (
+                        <DownloadButton
+                            documentId={document.document_id}
+                            versionId={document.version_id ?? null}
+                            filename={document.title}
+                            isReloading={isReloading}
+                            compact={compactActions}
+                        />
+                    )}
+                    {(document.actions ?? []).map((action, index) =>
+                        action.type === "download" ? (
+                            <UrlDownloadButton
+                                key={`${action.type}:${action.url}:${index}`}
+                                href={action.url}
+                                compact={compactActions}
+                            />
+                        ) : (
+                            <ExternalSourceLinkButton
+                                key={`${action.type}:${action.url}:${index}`}
+                                link={{
+                                    href: action.url,
+                                    label: action.label,
+                                    title: action.title ?? action.label,
+                                }}
+                                compact={compactActions}
+                            />
+                        ),
                     )}
                 </div>
             </div>
-            <div className="shrink-0">
-                <DownloadButton
-                    documentId={documentId}
-                    versionId={versionId}
-                    filename={filename}
-                    isReloading={isReloading}
-                />
-            </div>
+            {document.metadata.length > 0 && (
+                <div className="mt-1 flex w-full flex-wrap items-center gap-x-3 gap-y-1 font-serif text-sm text-gray-600">
+                    {document.metadata.map((item, index) => (
+                        <span key={`${item.label}:${item.value}:${index}`}>
+                            {item.label}: {formatMetadataValue(item)}
+                        </span>
+                    ))}
+                </div>
+            )}
         </div>
     );
 }
 
-function RelevantQuoteSection({
-    citation,
-    filename,
-    activeQuoteId,
-    onQuoteSelect,
-}: {
-    citation: Citation;
-    filename: string;
-    activeQuoteId: string | null;
-    onQuoteSelect: (quoteId: string) => void;
-}) {
-    const citationQuotes = getDocumentCitationQuotes(citation);
-    const pagesLabel = formatCitationPage(citation);
-    const citationText = [filename, pagesLabel].filter(Boolean).join(", ");
-    const relevantQuotes: CitationQuoteHeaderItem[] = citationQuotes.map(
-        (quote, index) => {
-            const pageLabel = formatCitationQuotePage(
-                citation,
-                quote.page,
-                quote,
-            );
-            return {
-                id: `document:${citation.ref}:${index}`,
-                quote: cleanCitationQuoteText(citation, quote.quote),
-                inlineDetail: pageLabel || null,
-                citationText: [filename, pageLabel].filter(Boolean).join(", "),
-            };
-        },
-    );
-    const currentIndex = Math.max(
-        0,
-        relevantQuotes.findIndex((quote) => quote.id === activeQuoteId),
-    );
+// ---------------------------------------------------------------------------
+// Source actions
+// ---------------------------------------------------------------------------
 
+function formatMetadataValue(item: PanelDocument["metadata"][number]): string {
+    if (item.format !== "date") return item.value;
+    const value = item.value;
+    const date = /^\d{4}-\d{2}-\d{2}$/.test(value)
+        ? new Date(`${value}T00:00:00Z`)
+        : new Date(value);
+    if (Number.isNaN(date.getTime())) return value;
+    return new Intl.DateTimeFormat("en-US", {
+        month: "long",
+        day: "numeric",
+        year: "numeric",
+        timeZone: "UTC",
+    }).format(date);
+}
+
+function UrlDownloadButton({
+    href,
+    compact,
+}: {
+    href: string;
+    compact: boolean;
+}) {
     return (
-        <CitationQuotesHeader
-            quotes={relevantQuotes}
-            activeQuoteId={activeQuoteId}
-            currentIndex={currentIndex}
-            citationRef={citation.ref}
-            citationText={citationText}
-            onSelect={(quote) => onQuoteSelect(quote.id)}
-            onIndexChange={(index) => {
-                const quote = relevantQuotes[index];
-                if (quote) onQuoteSelect(quote.id);
-            }}
-        />
+        <PillButton
+            asChild
+            tone="white"
+            className={compact ? "h-6 w-6 px-0 py-0" : undefined}
+        >
+            <a
+                href={href}
+                target="_blank"
+                rel="noopener noreferrer"
+                download
+                aria-label="Download"
+                title="Download"
+            >
+                <Download className="h-3.5 w-3.5" />
+                <span className={compact ? "sr-only" : undefined}>
+                    Download
+                </span>
+            </a>
+        </PillButton>
     );
 }
 
-// ---------------------------------------------------------------------------
-// Download button
-// ---------------------------------------------------------------------------
+function ExternalSourceLinkButton({
+    link,
+    compact,
+}: {
+    link: ExternalSourceLink;
+    compact: boolean;
+}) {
+    return (
+        <PillButton
+            asChild
+            tone="white"
+            className={compact ? "h-6 w-6 px-0 py-0" : undefined}
+        >
+            <a
+                href={link.href}
+                target="_blank"
+                rel="noopener noreferrer"
+                aria-label={link.title}
+                title={link.title}
+            >
+                <ExternalLink className="h-3.5 w-3.5" />
+                <span className={compact ? "sr-only" : undefined}>
+                    {link.label}
+                </span>
+            </a>
+        </PillButton>
+    );
+}
 
 function DownloadButton({
     documentId,
     versionId,
     filename,
     isReloading,
+    compact,
 }: {
     documentId: string;
     versionId: string | null;
     filename: string;
     isReloading?: boolean;
+    compact: boolean;
 }) {
     const [busy, setBusy] = useState(false);
 
@@ -354,20 +467,11 @@ function DownloadButton({
         if (busy || isReloading) return;
         setBusy(true);
         try {
-            const {
-                data: { session },
-            } = await supabase.auth.getSession();
-            const token = session?.access_token;
-            const apiBase =
-                process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:3001";
             const qs = versionId
                 ? `?version_id=${encodeURIComponent(versionId)}`
                 : "";
-            const resp = await fetch(
-                `${apiBase}/single-documents/${documentId}/docx${qs}`,
-                {
-                    headers: token ? { Authorization: `Bearer ${token}` } : {},
-                },
+            const resp = await authenticatedFetch(
+                `${API_BASE}/single-documents/${documentId}/docx${qs}`,
             );
             if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
             const blob = await resp.blob();
@@ -386,17 +490,18 @@ function DownloadButton({
 
     const spinning = busy || isReloading;
     return (
-        <button
+        <PillButton
+            tone="white"
             onClick={handleClick}
             disabled={spinning}
-            className="inline-flex items-center gap-1 rounded-lg border border-gray-200 px-2 py-1.5 text-xs font-medium text-gray-600 hover:bg-gray-100 hover:text-gray-800 disabled:opacity-50 disabled:cursor-not-allowed"
+            className={compact ? "h-6 w-6 px-0 py-0" : undefined}
         >
             {spinning ? (
                 <Loader2 className="h-3.5 w-3.5 animate-spin" />
             ) : (
                 <Download className="h-3.5 w-3.5" />
             )}
-            Download
-        </button>
+            <span className={compact ? "sr-only" : undefined}>Download</span>
+        </PillButton>
     );
 }

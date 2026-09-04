@@ -6,6 +6,7 @@ import {
     useEffect,
     useLayoutEffect,
     useMemo,
+    useReducer,
     useRef,
     useState,
 } from "react";
@@ -25,7 +26,7 @@ import {
     deleteDocument,
     getChat,
     getProject,
-    uploadProjectDocument,
+    uploadProjectDocuments,
     createProjectFolder,
     renameProjectFolder,
     deleteProjectFolder,
@@ -41,6 +42,7 @@ import type { ChatInputHandle } from "@/app/components/assistant/ChatInput";
 import { ProjectExplorer } from "@/app/components/projects/ProjectExplorer";
 import { PdfView } from "@/app/components/shared/views/PdfView";
 import { SpreadsheetView } from "@/app/components/shared/views/SpreadsheetView";
+import { ConfirmPopup } from "@/app/components/popups/ConfirmPopup";
 import { OwnerOnlyPopup } from "@/app/components/popups/OwnerOnlyPopup";
 import { DocxView } from "@/app/components/shared/views/DocxView";
 import { MikeIcon } from "@/app/components/chat/mike-icon";
@@ -57,10 +59,15 @@ import type {
     Message,
     Project,
 } from "@/app/components/shared/types";
+import { expandCitationToEntries } from "@/app/components/shared/types";
+import { resolveDocumentViewType } from "@/app/lib/documentViewType";
 import {
-    expandCitationToEntries,
-    isSpreadsheetFilename,
-} from "@/app/components/shared/types";
+    INITIAL_FOLDER_DELETE_DIALOG_STATE,
+    clearDeletedDocumentId,
+    clearDeletedDocumentTarget,
+    folderDeleteDialogReducer,
+    removeDeletedDocumentTabs,
+} from "@/app/lib/folderDeleteState";
 
 interface Props {
     params: Promise<{ id: string; chatId: string }>;
@@ -84,11 +91,6 @@ type EditScrollTarget = {
     ins_w_id?: string | null;
     del_w_id?: string | null;
 };
-
-function isDocxTab(filename: string) {
-    const ext = filename.split(".").pop()?.toLowerCase();
-    return ext === "docx" || ext === "doc";
-}
 
 const ICON_SIZE = 28;
 const GAP = 14;
@@ -220,6 +222,13 @@ export default function ProjectAssistantChatPage({ params }: Props) {
     const [chatLoaded, setChatLoaded] = useState(false);
     const [creatingChat, setCreatingChat] = useState(false);
     const [deletingChat, setDeletingChat] = useState(false);
+    const [folderDeleteDialog, dispatchFolderDeleteDialog] = useReducer(
+        folderDeleteDialogReducer,
+        INITIAL_FOLDER_DELETE_DIALOG_STATE,
+    );
+    const pendingDeleteFolder = folderDeleteDialog.pending;
+    const pendingDeleteFolderStatus = folderDeleteDialog.status;
+    const folderDeleteDismissTimerRef = useRef<number | null>(null);
 
     // Panel widths
     const [explorerWidth, setExplorerWidth] = useState(EXPLORER_DEFAULT);
@@ -245,6 +254,9 @@ export default function ProjectAssistantChatPage({ params }: Props) {
     );
 
     const activeTab = tabs.find((t) => t.documentId === activeTabId) ?? null;
+    const activeTabViewType = activeTab
+        ? resolveDocumentViewType({ filename: activeTab.filename })
+        : null;
     const tabBarRef = useRef<HTMLDivElement | null>(null);
     const tabItemRefs = useRef<Record<string, HTMLDivElement | null>>({});
 
@@ -263,6 +275,18 @@ export default function ProjectAssistantChatPage({ params }: Props) {
         renameChat: renameChatInHistory,
     } = useChatHistoryContext();
     const [initialMessages] = useState<Message[]>(newChatMessages ?? []);
+    const [chatModel, setChatModel] = useState<string | null | undefined>(
+        initialMessages.length > 0
+            ? (initialMessages[0]?.model ?? null)
+            : undefined,
+    );
+    const [chatReasoningLevel, setChatReasoningLevel] = useState<
+        NonNullable<Message["reasoning"]> | null | undefined
+    >(
+        initialMessages.length > 0
+            ? (initialMessages[0]?.reasoning ?? null)
+            : undefined,
+    );
     const { messages, isResponseLoading, handleChat, setMessages, cancel } =
         useAssistantChat({ initialMessages, chatId, projectId });
     const pendingInitialUserMessageRef = useRef<Message | null>(
@@ -274,6 +298,22 @@ export default function ProjectAssistantChatPage({ params }: Props) {
     const hasLoaded = useRef(false);
     const hasAutoSent = useRef(false);
     const hasInitialScrolled = useRef(false);
+
+    const clearFolderDeleteDismissTimer = useCallback(() => {
+        if (folderDeleteDismissTimerRef.current === null) return;
+        clearTimeout(folderDeleteDismissTimerRef.current);
+        folderDeleteDismissTimerRef.current = null;
+    }, []);
+
+    useEffect(() => {
+        return () => clearFolderDeleteDismissTimer();
+    }, [clearFolderDeleteDismissTimer]);
+
+    useEffect(() => {
+        if (activeTabId) return;
+        setActiveQuotes(null);
+        setEditScrollTarget(null);
+    }, [activeTabId]);
 
     useEffect(() => {
         setSidebarOpen(false);
@@ -347,6 +387,8 @@ export default function ProjectAssistantChatPage({ params }: Props) {
             .then(({ chat, messages: loaded }) => {
                 setChatTitle(chat.title);
                 setChatOwnerId(chat.user_id ?? null);
+                setChatModel(chat.model ?? null);
+                setChatReasoningLevel(chat.reasoning_level ?? null);
                 if (loaded.length > 0) setMessages(loaded);
             })
             .catch(() => router.replace(`/projects/${projectId}/assistant`))
@@ -632,8 +674,14 @@ export default function ProjectAssistantChatPage({ params }: Props) {
         if (!files.length) return;
         setUploading(true);
         try {
-            const uploaded = await Promise.all(
-                files.map((f) => uploadProjectDocument(projectId, f)),
+            const outcomes = await uploadProjectDocuments(
+                projectId,
+                files.map((file) => ({ file })),
+            );
+            const uploaded = outcomes.flatMap((outcome) =>
+                outcome.status === "completed" && outcome.result
+                    ? [outcome.result]
+                    : [],
             );
             setProject((prev) => {
                 if (!prev) return prev;
@@ -691,31 +739,125 @@ export default function ProjectAssistantChatPage({ params }: Props) {
         );
     };
 
-    const handleDeleteFolder = async (folderId: string) => {
-        const toDelete = new Set<string>();
-        function collectIds(id: string) {
-            toDelete.add(id);
-            (project?.folders ?? [])
-                .filter((f) => f.parent_folder_id === id)
-                .forEach((f) => collectIds(f.id));
+    const folderDeleteImpact = useCallback(
+        (folderId: string) => {
+            const childrenByParent = new Map<string, string[]>();
+            for (const folder of project?.folders ?? []) {
+                if (!folder.parent_folder_id) continue;
+                const children =
+                    childrenByParent.get(folder.parent_folder_id) ?? [];
+                children.push(folder.id);
+                childrenByParent.set(folder.parent_folder_id, children);
+            }
+
+            const toDelete = new Set<string>();
+            const stack = [folderId];
+            while (stack.length > 0) {
+                const id = stack.pop();
+                if (!id || toDelete.has(id)) continue;
+                toDelete.add(id);
+                stack.push(...(childrenByParent.get(id) ?? []));
+            }
+
+            const folderIds = [...toDelete];
+            const documentIds = (project?.documents ?? [])
+                .filter((document) =>
+                    document.folder_id
+                        ? toDelete.has(document.folder_id)
+                        : false,
+                )
+                .map((document) => document.id);
+            return {
+                folderIds,
+                documentIds,
+                documentCount: documentIds.length,
+            };
+        },
+        [project?.documents, project?.folders],
+    );
+
+    const requestDeleteFolder = useCallback(
+        async (folderId: string) => {
+            const folder = (project?.folders ?? []).find(
+                (candidate) => candidate.id === folderId,
+            );
+            if (!folder) return;
+
+            const impact = folderDeleteImpact(folderId);
+            clearFolderDeleteDismissTimer();
+            dispatchFolderDeleteDialog({
+                type: "request",
+                pending: {
+                    folder,
+                    folderIds: impact.folderIds,
+                    documentIds: impact.documentIds,
+                    documentCount: impact.documentCount,
+                },
+            });
+        },
+        [clearFolderDeleteDismissTimer, folderDeleteImpact, project?.folders],
+    );
+
+    const confirmDeletePendingFolder = async () => {
+        const pending = pendingDeleteFolder;
+        if (!pending || pendingDeleteFolderStatus === "deleting") return;
+
+        dispatchFolderDeleteDialog({
+            type: "start",
+            folderId: pending.folder.id,
+        });
+
+        const folderIds = new Set(pending.folderIds);
+        const deletedDocumentIds = new Set(pending.documentIds);
+
+        try {
+            await deleteProjectFolder(projectId, pending.folder.id);
+            setProject((currentProject) =>
+                currentProject
+                    ? {
+                          ...currentProject,
+                          folders: (currentProject.folders ?? []).filter(
+                              (folder) => !folderIds.has(folder.id),
+                          ),
+                          documents: (currentProject.documents ?? []).filter(
+                              (document) =>
+                                  !deletedDocumentIds.has(document.id),
+                          ),
+                      }
+                    : currentProject,
+            );
+            setTabs((currentTabs) =>
+                removeDeletedDocumentTabs(currentTabs, deletedDocumentIds),
+            );
+            setActiveTabId((currentId) =>
+                clearDeletedDocumentId(currentId, deletedDocumentIds),
+            );
+            setSelectedDocId((currentId) =>
+                clearDeletedDocumentId(currentId, deletedDocumentIds),
+            );
+            setEditScrollTarget((currentTarget) =>
+                clearDeletedDocumentTarget(currentTarget, deletedDocumentIds),
+            );
+            dispatchFolderDeleteDialog({
+                type: "complete",
+                folderId: pending.folder.id,
+            });
+
+            clearFolderDeleteDismissTimer();
+            folderDeleteDismissTimerRef.current = window.setTimeout(() => {
+                dispatchFolderDeleteDialog({
+                    type: "dismiss-completed",
+                    folderId: pending.folder.id,
+                });
+                folderDeleteDismissTimerRef.current = null;
+            }, 650);
+        } catch (error) {
+            console.error("delete folder failed", error);
+            dispatchFolderDeleteDialog({
+                type: "failed",
+                folderId: pending.folder.id,
+            });
         }
-        collectIds(folderId);
-        await deleteProjectFolder(projectId, folderId);
-        setProject((prev) =>
-            prev
-                ? {
-                      ...prev,
-                      folders: (prev.folders ?? []).filter(
-                          (f) => !toDelete.has(f.id),
-                      ),
-                      documents: (prev.documents ?? []).map((d) =>
-                          d.folder_id && toDelete.has(d.folder_id)
-                              ? { ...d, folder_id: null }
-                              : d,
-                      ),
-                  }
-                : prev,
-        );
     };
 
     const handleMoveDoc = async (
@@ -800,16 +942,22 @@ export default function ProjectAssistantChatPage({ params }: Props) {
                         ? {
                               label: project.name,
                               onClick: () =>
-                                  router.push(`/projects/${projectId}/assistant`),
+                                  router.push(`/projects/${projectId}`),
                               title: "Back to project",
                           }
                         : {
                               loading: true,
                               skeletonClassName: "w-32",
                               onClick: () =>
-                                  router.push(`/projects/${projectId}/assistant`),
+                                  router.push(`/projects/${projectId}`),
                               title: "Back to project",
                           },
+                    {
+                        label: "Chats",
+                        onClick: () =>
+                            router.push(`/projects/${projectId}/assistant`),
+                        title: "Back to Chats",
+                    },
                     chatLoaded
                         ? {
                               label: chatTitle ?? "Untitled New Chat",
@@ -834,16 +982,14 @@ export default function ProjectAssistantChatPage({ params }: Props) {
                                     {
                                         label: "Rename",
                                         icon: Pencil,
-                                        onSelect: () =>
-                                            void handleRenameChat(),
+                                        onSelect: () => void handleRenameChat(),
                                     },
                                     {
                                         label: deletingChat
                                             ? "Deleting..."
                                             : "Delete",
                                         icon: Trash2,
-                                        onSelect: () =>
-                                            void handleDeleteChat(),
+                                        onSelect: () => void handleDeleteChat(),
                                         disabled: deletingChat,
                                         variant: "danger",
                                     },
@@ -969,7 +1115,7 @@ export default function ProjectAssistantChatPage({ params }: Props) {
                                     onDocClick={handleDocClick}
                                     onCreateFolder={handleCreateFolder}
                                     onRenameFolder={handleRenameFolder}
-                                    onDeleteFolder={handleDeleteFolder}
+                                    onDeleteFolder={requestDeleteFolder}
                                     onDeleteDoc={handleDeleteDoc}
                                     onMoveDoc={handleMoveDoc}
                                     onMoveFolder={handleMoveFolder}
@@ -1026,9 +1172,7 @@ export default function ProjectAssistantChatPage({ params }: Props) {
                                     project?.documents ?? []
                                 ).find((d) => d.id === tab.documentId)
                                     ?.latest_version_number as
-                                    | number
-                                    | null
-                                    | undefined;
+                                    number | null | undefined;
                                 const showVersionBadge =
                                     typeof versionNumber === "number" &&
                                     Number.isFinite(versionNumber) &&
@@ -1085,7 +1229,7 @@ export default function ProjectAssistantChatPage({ params }: Props) {
                     </div>
                     <div className="flex-1 min-h-0 overflow-hidden flex flex-col">
                         {activeTab ? (
-                            isDocxTab(activeTab.filename) ? (
+                            activeTabViewType === "docx" ? (
                                 <DocxView
                                     key={activeTab.documentId}
                                     documentId={activeTab.documentId}
@@ -1117,7 +1261,7 @@ export default function ProjectAssistantChatPage({ params }: Props) {
                                     }
                                     rounded={false}
                                 />
-                            ) : isSpreadsheetFilename(activeTab.filename) ? (
+                            ) : activeTabViewType === "spreadsheet" ? (
                                 <SpreadsheetView
                                     key={activeTab.documentId}
                                     documentId={activeTab.documentId}
@@ -1169,14 +1313,14 @@ export default function ProjectAssistantChatPage({ params }: Props) {
                         <div className="flex-1 px-4 py-4 space-y-4">
                             <div className="flex justify-end">
                                 <div className="bg-gray-100 rounded-2xl p-4 w-3/4">
-                                    <div className="h-3 bg-gradient-to-r from-gray-200 via-gray-300 to-gray-200 bg-[length:200%_100%] animate-[shimmer_2s_ease-in-out_infinite] rounded w-full" />
+                                    <div className="theme-shimmer h-3 bg-[length:200%_100%] animate-[shimmer_2s_ease-in-out_infinite] rounded w-full" />
                                 </div>
                             </div>
                             <div className="space-y-2">
                                 {[1, 2, 3].map((i) => (
                                     <div
                                         key={i}
-                                        className={`h-3 bg-gradient-to-r from-gray-200 via-gray-300 to-gray-200 bg-[length:200%_100%] animate-[shimmer_2s_ease-in-out_infinite] rounded ${i === 3 ? "w-4/6" : "w-full"}`}
+                                        className={`theme-shimmer h-3 bg-[length:200%_100%] animate-[shimmer_2s_ease-in-out_infinite] rounded ${i === 3 ? "w-4/6" : "w-full"}`}
                                     />
                                 ))}
                             </div>
@@ -1188,7 +1332,7 @@ export default function ProjectAssistantChatPage({ params }: Props) {
                     ) : (
                         <div
                             ref={messagesContainerRef}
-                            className="flex-1 overflow-y-auto px-4 pt-6 md:pt-8 space-y-6 md:space-y-8 min-h-0"
+                            className="assistant-chat-message-fade flex-1 overflow-y-auto px-4 pt-6 md:pt-8 space-y-6 md:space-y-8 min-h-0"
                             style={{
                                 paddingBottom: DEFAULT_ASSISTANT_BOTTOM_PADDING,
                                 scrollbarGutter: "stable",
@@ -1215,6 +1359,17 @@ export default function ProjectAssistantChatPage({ params }: Props) {
                                                 content={msg.content ?? ""}
                                                 files={msg.files}
                                                 workflow={msg.workflow}
+                                                onFileClick={(file) => {
+                                                    if (!file.document_id)
+                                                        return;
+                                                    handleOpenDocument({
+                                                        documentId:
+                                                            file.document_id,
+                                                        filename: file.filename,
+                                                        versionId: null,
+                                                        versionNumber: null,
+                                                    });
+                                                }}
                                             />
                                         </div>
                                     ) : (
@@ -1227,9 +1382,7 @@ export default function ProjectAssistantChatPage({ params }: Props) {
                                             }
                                             isError={!!msg.error}
                                             citations={msg.citations}
-                                            citationStatus={
-                                                msg.citationStatus
-                                            }
+                                            citationStatus={msg.citationStatus}
                                             onCitationClick={
                                                 handleCitationClick
                                             }
@@ -1257,14 +1410,32 @@ export default function ProjectAssistantChatPage({ params }: Props) {
 
                     {/* ChatInput */}
                     <div className="absolute bottom-2 left-0 right-0 z-30 w-full md:bottom-3">
-                        <div className="pointer-events-none absolute -bottom-2 left-4 right-4 z-0 h-7 bg-white/50 backdrop-blur-[1px] md:-bottom-3" />
+                        <div className="pointer-events-none absolute -bottom-2 left-4 right-4 z-0 h-7 bg-app-background md:-bottom-3" />
                         <div className="relative z-20 w-full px-4">
                             <ChatInput
                                 ref={chatInputRef}
                                 onSubmit={handleSubmit}
                                 onCancel={cancel}
                                 isLoading={isResponseLoading}
+                                chatKey={chatId}
+                                chatModel={chatModel}
+                                chatReasoningLevel={chatReasoningLevel}
                                 hideAddDocButton
+                                projectId={projectId}
+                                onDocumentClick={handleDocClick}
+                                onDocumentsUploaded={(documents) =>
+                                    setProject((prev) =>
+                                        prev
+                                            ? {
+                                                  ...prev,
+                                                  documents: [
+                                                      ...(prev.documents ?? []),
+                                                      ...documents,
+                                                  ],
+                                              }
+                                            : prev,
+                                    )
+                                }
                                 projectName={project?.name}
                                 projectCmNumber={project?.cm_number}
                             />
@@ -1276,6 +1447,61 @@ export default function ProjectAssistantChatPage({ params }: Props) {
                 open={!!ownerOnlyAction}
                 action={ownerOnlyAction ?? undefined}
                 onClose={() => setOwnerOnlyAction(null)}
+            />
+            <ConfirmPopup
+                open={!!pendingDeleteFolder}
+                title="Delete folder?"
+                message={
+                    pendingDeleteFolder ? (
+                        <div className="space-y-2">
+                            <p>
+                                This will permanently delete{" "}
+                                <span className="font-medium text-gray-950">
+                                    {pendingDeleteFolder.folderIds.length}{" "}
+                                    {pendingDeleteFolder.folderIds.length === 1
+                                        ? "folder"
+                                        : "folders"}
+                                </span>
+                                , including{" "}
+                                <span className="font-medium text-gray-950">
+                                    {pendingDeleteFolder.folder.name}
+                                </span>
+                                {pendingDeleteFolder.folderIds.length > 1
+                                    ? " and its nested subfolders"
+                                    : ""}
+                                .
+                            </p>
+                            {pendingDeleteFolder.documentCount > 0 && (
+                                <p>
+                                    {pendingDeleteFolder.documentCount}{" "}
+                                    {pendingDeleteFolder.documentCount === 1
+                                        ? "document"
+                                        : "documents"}{" "}
+                                    in the deleted{" "}
+                                    {pendingDeleteFolder.folderIds.length === 1
+                                        ? "folder"
+                                        : "folders"}{" "}
+                                    will also be permanently deleted.
+                                </p>
+                            )}
+                        </div>
+                    ) : undefined
+                }
+                confirmLabel="Delete"
+                confirmStatus={
+                    pendingDeleteFolderStatus === "deleting"
+                        ? "loading"
+                        : pendingDeleteFolderStatus === "deleted"
+                          ? "complete"
+                          : "idle"
+                }
+                cancelLabel="Cancel"
+                onCancel={() => {
+                    if (pendingDeleteFolderStatus === "deleting") return;
+                    clearFolderDeleteDismissTimer();
+                    dispatchFolderDeleteDialog({ type: "cancel" });
+                }}
+                onConfirm={() => void confirmDeletePendingFolder()}
             />
         </div>
     );

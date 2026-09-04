@@ -3,6 +3,17 @@
 import { useState } from "react";
 import { ChevronDown, type LucideIcon } from "lucide-react";
 import { cn } from "@/app/lib/utils";
+import {
+    Dropdown,
+    DropdownContent,
+    DropdownItem,
+    DropdownTrigger,
+} from "@/shared/ui/DropdownUI";
+import {
+    LIQUID_GLASS_HOVER_CLASS,
+    LIQUID_GLASS_SELECTED_CLASS,
+    LIQUID_GLASS_SUBTLE_CLASS,
+} from "@/shared/ui/LiquidGlassUI";
 
 export type ModalSelectOption =
     | string
@@ -63,64 +74,66 @@ export function ModalSelect({
     }
 
     return (
-        <div className="relative">
-            <button
-                id={id}
-                type="button"
-                onClick={() => setOpen(!isOpen)}
-                disabled={disabled}
-                className={cn(
-                    "flex h-10 w-full items-center justify-between rounded-xl border border-white/70 bg-white/55 px-3 text-sm text-gray-700 shadow-[0_3px_9px_rgba(15,23,42,0.052),inset_0_1px_0_rgba(255,255,255,0.86),inset_0_-1px_0_rgba(255,255,255,0.58)] backdrop-blur-xl transition-colors hover:bg-white/70 focus:bg-white/70 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60",
-                    className,
-                )}
-                aria-haspopup="listbox"
-                aria-expanded={isOpen}
-            >
-                <span className="flex min-w-0 items-center gap-2">
-                    {selected?.icon && (
-                        <selected.icon
-                            className={cn(
-                                "h-3.5 w-3.5 shrink-0",
-                                selected.iconClassName,
-                            )}
-                        />
+        <Dropdown open={isOpen} onOpenChange={setOpen}>
+            <DropdownTrigger asChild>
+                <button
+                    id={id}
+                    type="button"
+                    disabled={disabled}
+                    className={cn(
+                        `flex h-10 w-full items-center justify-between rounded-xl px-3 text-sm text-gray-700 ${LIQUID_GLASS_SUBTLE_CLASS} ${LIQUID_GLASS_HOVER_CLASS} backdrop-blur-xl transition-colors focus:outline-none disabled:cursor-not-allowed disabled:opacity-60`,
+                        isOpen && LIQUID_GLASS_SELECTED_CLASS,
+                        className,
                     )}
-                    <span
-                        className={cn(
-                            "truncate",
-                            !selected && !hasValue && "text-gray-400",
+                >
+                    <span className="flex min-w-0 items-center gap-2">
+                        {selected?.icon && (
+                            <selected.icon
+                                className={cn(
+                                    "h-3.5 w-3.5 shrink-0",
+                                    selected.iconClassName,
+                                )}
+                            />
                         )}
-                    >
-                        {selected?.label ?? (hasValue ? value : placeholder)}
+                        <span
+                            className={cn(
+                                "truncate",
+                                !selected && !hasValue && "text-gray-400",
+                            )}
+                        >
+                            {selected?.label ??
+                                (hasValue ? value : placeholder)}
+                        </span>
                     </span>
-                </span>
-                <ChevronDown
-                    className={cn(
-                        "ml-2 h-3.5 w-3.5 shrink-0 text-gray-400 transition-transform",
-                        isOpen && "rotate-180",
-                    )}
-                />
-            </button>
+                    <ChevronDown
+                        className={cn(
+                            "ml-2 h-3.5 w-3.5 shrink-0 text-gray-400 transition-transform",
+                            isOpen && "rotate-180",
+                        )}
+                    />
+                </button>
+            </DropdownTrigger>
             {isOpen && !disabled && (
-                <div
-                    role="listbox"
-                    aria-labelledby={id}
+                <DropdownContent
+                    align="start"
+                    sideOffset={4}
+                    collisionPadding={12}
+                    onEscapeKeyDown={(event) => event.stopPropagation()}
                     className={cn(
-                        "absolute left-0 top-full z-30 mt-1 max-h-56 w-full overflow-y-auto rounded-2xl border border-white/70 bg-gray-50/95 p-1 shadow-[0_12px_32px_rgba(15,23,42,0.156),inset_0_1px_0_rgba(255,255,255,0.86),inset_0_-1px_0_rgba(255,255,255,0.58)] backdrop-blur-2xl",
+                        "max-h-56 w-[var(--radix-dropdown-menu-trigger-width)] overflow-y-auto rounded-2xl p-1",
                         menuClassName,
                     )}
                 >
                     {normalizedOptions.map((option) => (
-                        <button
+                        <DropdownItem
                             key={option.value}
-                            type="button"
-                            role="option"
-                            aria-selected={option.value === value}
-                            onClick={() => handleSelect(option.value)}
+                            textValue={option.label}
+                            selected={option.value === value}
+                            onSelect={() => handleSelect(option.value)}
                             className={cn(
-                                "flex w-full items-center rounded-md px-3 py-2 text-left text-sm transition-all hover:bg-gray-100/70",
+                                "theme-dropdown-item flex w-full items-center rounded-md px-3 py-2 text-left text-xs transition-all",
                                 option.value === value
-                                    ? "bg-gray-100 text-gray-900"
+                                    ? "theme-dropdown-selected text-gray-900"
                                     : "text-gray-700",
                             )}
                         >
@@ -137,10 +150,10 @@ export function ModalSelect({
                                     {option.label}
                                 </span>
                             </span>
-                        </button>
+                        </DropdownItem>
                     ))}
-                </div>
+                </DropdownContent>
             )}
-        </div>
+        </Dropdown>
     );
 }

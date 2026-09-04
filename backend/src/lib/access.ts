@@ -48,7 +48,7 @@ export async function checkProjectAccess(
         return { ok: true, isOwner: true, project: proj };
     }
     const sharedWith = Array.isArray(proj.shared_with) ? proj.shared_with : [];
-    const email = (userEmail ?? "").toLowerCase();
+    const email = (userEmail ?? "").trim().toLowerCase();
     if (
         email &&
         sharedWith.some((e) => (e ?? "").toLowerCase() === email)
@@ -65,20 +65,46 @@ export async function checkProjectAccess(
  * project-membership check via `shared_with`.
  */
 export async function ensureDocAccess(
-    doc: { user_id: string; project_id: string | null },
+    doc: {
+        user_id: string;
+        project_id: string | null;
+        workflow_id?: string | null;
+    },
     userId: string,
     userEmail: string | null | undefined,
     db: Db,
-): Promise<{ ok: true; isOwner: boolean } | { ok: false }> {
-    if (doc.user_id === userId) return { ok: true, isOwner: true };
-    if (!doc.project_id) return { ok: false };
-    const access = await checkProjectAccess(
-        doc.project_id,
-        userId,
-        userEmail,
-        db,
-    );
-    if (access.ok) return { ok: true, isOwner: false };
+): Promise<{ ok: true; isOwner: boolean; canEdit: boolean } | { ok: false }> {
+    if (doc.user_id === userId) {
+        return { ok: true, isOwner: true, canEdit: true };
+    }
+    if (doc.project_id) {
+        const access = await checkProjectAccess(
+            doc.project_id,
+            userId,
+            userEmail,
+            db,
+        );
+        if (access.ok) {
+            return { ok: true, isOwner: false, canEdit: true };
+        }
+    }
+    if (doc.workflow_id) {
+        const normalizedEmail = (userEmail ?? "").trim().toLowerCase();
+        if (!normalizedEmail) return { ok: false };
+        const { data: share } = await db
+            .from("workflow_shares")
+            .select("allow_edit")
+            .eq("workflow_id", doc.workflow_id)
+            .eq("shared_with_email", normalizedEmail)
+            .maybeSingle();
+        if (share) {
+            return {
+                ok: true,
+                isOwner: false,
+                canEdit: share.allow_edit === true,
+            };
+        }
+    }
     return { ok: false };
 }
 
@@ -171,13 +197,18 @@ export async function listAccessibleProjectIds(
     userEmail: string | null | undefined,
     db: Db,
 ): Promise<string[]> {
+    const normalizedEmail = userEmail?.trim().toLowerCase() ?? "";
     const [{ data: own }, { data: shared }] = await Promise.all([
         db.from("projects").select("id").eq("user_id", userId),
-        userEmail
+        normalizedEmail
             ? db
                   .from("projects")
                   .select("id")
-                  .filter("shared_with", "cs", JSON.stringify([userEmail]))
+                  .filter(
+                      "shared_with",
+                      "cs",
+                      JSON.stringify([normalizedEmail]),
+                  )
                   .neq("user_id", userId)
             : Promise.resolve({ data: [] as { id: string }[] }),
     ]);

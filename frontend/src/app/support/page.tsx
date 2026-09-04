@@ -4,6 +4,8 @@ import { useState, useEffect } from "react";
 import { Send, CheckCircle } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/app/contexts/AuthContext";
+import { FieldLabel } from "@/app/components/ui/form-field";
+import { authenticatedFetch } from "@/app/lib/authEvents";
 
 type FeedbackType = "bug" | "feature" | "question" | "other";
 
@@ -57,7 +59,7 @@ export default function SupportPage() {
         setIsSubmitting(true);
 
         try {
-            const response = await fetch("/api/support", {
+            const response = await authenticatedFetch("/api/support", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
@@ -126,9 +128,9 @@ export default function SupportPage() {
                         <form onSubmit={handleSubmit} className="space-y-6">
                             {/* Feedback Type Selection */}
                             <div>
-                                <label className="block text-sm font-medium text-gray-700 mb-3">
+                                <FieldLabel as="p">
                                     What can we help you with?
-                                </label>
+                                </FieldLabel>
                                 <div className="grid grid-cols-2 gap-3">
                                     {feedbackTypes.map((type) => (
                                         <button
@@ -163,12 +165,9 @@ export default function SupportPage() {
                             {/* Link (for bugs) */}
                             {feedbackType === "bug" && (
                                 <div>
-                                    <label
-                                        htmlFor="link"
-                                        className="block text-sm font-medium text-gray-700 mb-2"
-                                    >
+                                    <FieldLabel htmlFor="link">
                                         Link to issue (optional)
-                                    </label>
+                                    </FieldLabel>
                                     <input
                                         type="url"
                                         id="link"
@@ -190,12 +189,9 @@ export default function SupportPage() {
 
                             {/* Subject */}
                             <div>
-                                <label
-                                    htmlFor="subject"
-                                    className="block text-sm font-medium text-gray-700 mb-2"
-                                >
+                                <FieldLabel htmlFor="subject">
                                     Subject
-                                </label>
+                                </FieldLabel>
                                 <input
                                     type="text"
                                     id="subject"
@@ -208,12 +204,9 @@ export default function SupportPage() {
 
                             {/* Message */}
                             <div>
-                                <label
-                                    htmlFor="message"
-                                    className="block text-sm font-medium text-gray-700 mb-2"
-                                >
+                                <FieldLabel htmlFor="message">
                                     Message
-                                </label>
+                                </FieldLabel>
                                 <textarea
                                     id="message"
                                     value={message}
@@ -228,7 +221,7 @@ export default function SupportPage() {
                             {/* Email Display (if logged in) */}
                             {user?.email && (
                                 <div className="text-sm text-gray-500">
-                                    We'll respond to:{" "}
+                                    We&apos;ll respond to:{" "}
                                     <span className="font-medium">
                                         {user.email}
                                     </span>

@@ -1,163 +1,129 @@
-import "dotenv/config";
-import express from "express";
-import cors from "cors";
-import helmet from "helmet";
-import rateLimit from "express-rate-limit";
-import { chatRouter } from "./routes/chat";
-import { projectsRouter } from "./routes/projects";
-import { projectChatRouter } from "./routes/projectChat";
-import { documentsRouter } from "./routes/documents";
-import { tabularRouter } from "./routes/tabular";
-import { workflowsRouter } from "./routes/workflows";
-import { userRouter } from "./routes/user";
-import { downloadsRouter } from "./routes/downloads";
-import { caseLawRouter } from "./routes/caseLaw";
+import { Worker as ThreadWorker } from "node:worker_threads";
+import path from "node:path";
+import { app } from "./app";
+import { manifestPublicKey } from "./lib/manifestSigning";
+import { validateRuntimeConfiguration } from "./lib/runtimeConfig";
+import { startAllWorkers, stopAllWorkers } from "./workerRuntime";
 
-const app = express();
 const PORT = process.env.PORT ?? 3001;
-const isProduction = process.env.NODE_ENV === "production";
 
-function envInt(name: string, fallback: number): number {
-  const raw = process.env[name];
-  if (!raw) return fallback;
-  const parsed = Number.parseInt(raw, 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+// Surface a malformed MANIFEST_SIGNING_KEY at boot rather than when someone's
+// first export fails. Unset is a valid choice and means manifests go out
+// unsigned; malformed is a misconfiguration, so stop rather than serve a
+// deployment whose exports will fail later.
+try {
+  validateRuntimeConfiguration();
+  const signingKey = manifestPublicKey();
+  if (signingKey) {
+    console.log(`Export manifests signed with key ${signingKey.key_id}`);
+  }
+} catch (err) {
+  console.error(err instanceof Error ? err.message : String(err));
+  process.exit(1);
 }
 
-function minutes(value: number): number {
-  return value * 60 * 1000;
-}
+/**
+ * Where background work runs, relative to this API process:
+ *   "thread" (default) — a worker_thread in this process: queue workers and
+ *            maintenance run off the main event loop, so a CPU-heavy job can
+ *            never starve HTTP requests, with zero deployment changes.
+ *   "inline" — on the main thread (the historical behavior; escape hatch,
+ *            e.g. if a platform disallows worker_threads).
+ *   "none"  — not here at all: a standalone worker process (src/worker.ts)
+ *            runs them — a separate container or machine on the same
+ *            Postgres/Redis.
+ */
+const WORKERS_MODE = (() => {
+  const raw = process.env.WORKERS_MODE;
+  return raw === "inline" || raw === "none" ? raw : "thread";
+})();
 
-function hours(value: number): number {
-  return minutes(value * 60);
-}
+let workerThread: ThreadWorker | null = null;
+let shuttingDown = false;
 
-function makeLimiter(options: {
-  windowMs: number;
-  max: number;
-  message?: string;
-}) {
-  return rateLimit({
-    windowMs: options.windowMs,
-    max: options.max,
-    standardHeaders: true,
-    legacyHeaders: false,
-    skip: (req) => req.method === "OPTIONS",
-    message: {
-      detail:
-        options.message ?? "Too many requests. Please try again later.",
-    },
+function spawnWorkerThread(): void {
+  // In dev (tsx) this file is .ts and the thread entry must be too, loaded
+  // through tsx's CJS require hook; in prod both are compiled .js in dist.
+  const isTs = __filename.endsWith(".ts");
+  const entry = path.join(
+    __dirname,
+    isTs ? "workerThread.ts" : "workerThread.js",
+  );
+  workerThread = new ThreadWorker(entry, {
+    execArgv: isTs ? ["--require", "tsx/cjs"] : [],
+  });
+  workerThread.on("error", (err) => {
+    console.error("[worker-thread] error", err);
+  });
+  workerThread.on("exit", (code) => {
+    workerThread = null;
+    if (shuttingDown || code === 0) return;
+    // A crashed worker thread must not silently kill all background
+    // processing — respawn after a short pause. Durable state (db_jobs,
+    // Redis) means nothing is lost across the gap.
+    console.error(
+      `[worker-thread] exited with code ${code}; respawning in 5s`,
+    );
+    setTimeout(spawnWorkerThread, 5_000).unref();
   });
 }
 
-const generalLimiter = makeLimiter({
-  windowMs: minutes(envInt("RATE_LIMIT_GENERAL_WINDOW_MINUTES", 15)),
-  max: envInt("RATE_LIMIT_GENERAL_MAX", 300),
+const server = app.listen(PORT, () => {
+  console.log(
+    `Mike backend running on port ${PORT} (workers: ${WORKERS_MODE})`,
+  );
+  if (WORKERS_MODE === "thread") {
+    spawnWorkerThread();
+  } else if (WORKERS_MODE === "inline") {
+    startAllWorkers();
+  }
+  // WORKERS_MODE === "none": a standalone worker process owns background
+  // work (node dist/worker.js).
 });
 
-const chatLimiter = makeLimiter({
-  windowMs: minutes(envInt("RATE_LIMIT_CHAT_WINDOW_MINUTES", 15)),
-  max: envInt("RATE_LIMIT_CHAT_MAX", 30),
-  message: "Too many chat requests. Please try again later.",
-});
-
-const chatCreateLimiter = makeLimiter({
-  windowMs: minutes(envInt("RATE_LIMIT_CHAT_CREATE_WINDOW_MINUTES", 15)),
-  max: envInt("RATE_LIMIT_CHAT_CREATE_MAX", 60),
-});
-
-const uploadLimiter = makeLimiter({
-  windowMs: hours(envInt("RATE_LIMIT_UPLOAD_WINDOW_HOURS", 1)),
-  max: envInt("RATE_LIMIT_UPLOAD_MAX", 50),
-  message: "Too many upload requests. Please try again later.",
-});
-
-const exportLimiter = makeLimiter({
-  windowMs: hours(envInt("RATE_LIMIT_EXPORT_WINDOW_HOURS", 1)),
-  max: envInt("RATE_LIMIT_EXPORT_MAX", 10),
-  message: "Too many export requests. Please try again later.",
-});
-
-const dataDeleteLimiter = makeLimiter({
-  windowMs: hours(envInt("RATE_LIMIT_DATA_DELETE_WINDOW_HOURS", 1)),
-  max: envInt("RATE_LIMIT_DATA_DELETE_MAX", 20),
-  message: "Too many data deletion requests. Please try again later.",
-});
-
-function jsonLimitForPath(path: string): string {
-  return "50mb";
+// Graceful shutdown: on SIGTERM/SIGINT (orchestrator rollout, Ctrl-C), stop
+// accepting new connections, let in-flight requests/streams drain, stop the
+// background workers wherever they run, then exit 0. A hard timeout guards
+// against a connection or job that never drains.
+async function stopBackgroundWork(): Promise<void> {
+  if (WORKERS_MODE === "inline") {
+    await stopAllWorkers();
+    return;
+  }
+  const thread = workerThread;
+  if (!thread) return;
+  await new Promise<void>((resolve) => {
+    const timeout = setTimeout(() => resolve(), 10_000);
+    timeout.unref();
+    thread.once("exit", () => {
+      clearTimeout(timeout);
+      resolve();
+    });
+    thread.postMessage("shutdown");
+  });
 }
 
-app.disable("x-powered-by");
-app.set("trust proxy", envInt("TRUST_PROXY_HOPS", 1));
+async function shutdown(signal: string) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`Shutting down gracefully (${signal})`);
+  const forceExit = setTimeout(() => {
+    console.error("Graceful shutdown timed out — forcing exit");
+    process.exit(1);
+  }, 15_000);
+  forceExit.unref();
+  try {
+    await new Promise<void>((resolve, reject) =>
+      server.close((err) => (err ? reject(err) : resolve())),
+    );
+    await stopBackgroundWork();
+    console.log("Shutdown complete");
+    process.exit(0);
+  } catch (err) {
+    console.error("Error during graceful shutdown", err);
+    process.exit(1);
+  }
+}
 
-app.use(
-  helmet({
-    contentSecurityPolicy: {
-      directives: {
-        defaultSrc: ["'none'"],
-        baseUri: ["'none'"],
-        frameAncestors: ["'none'"],
-      },
-    },
-    crossOriginEmbedderPolicy: false,
-    hsts: isProduction
-      ? {
-          maxAge: 15552000,
-          includeSubDomains: true,
-        }
-      : false,
-    referrerPolicy: { policy: "no-referrer" },
-  }),
-);
-
-app.use(
-  cors({
-    origin: process.env.FRONTEND_URL ?? "http://localhost:3000",
-    credentials: true,
-  }),
-);
-
-app.use(generalLimiter);
-
-app.post("/chat", chatLimiter);
-app.post("/projects/:projectId/chat", chatLimiter);
-app.post("/tabular-review/:reviewId/chat", chatLimiter);
-app.post("/tabular-review/:reviewId/generate", chatLimiter);
-app.post("/chat/create", chatCreateLimiter);
-app.post("/chat/:chatId/generate-title", chatCreateLimiter);
-app.post("/single-documents", uploadLimiter);
-app.post("/single-documents/:documentId/versions", uploadLimiter);
-app.put(
-  "/single-documents/:documentId/versions/:versionId/file",
-  uploadLimiter,
-);
-app.post("/projects/:projectId/documents", uploadLimiter);
-app.get("/user/export", exportLimiter);
-app.get("/user/chats/export", exportLimiter);
-app.get("/user/tabular-reviews/export", exportLimiter);
-app.delete("/user/account", dataDeleteLimiter);
-app.delete("/user/chats", dataDeleteLimiter);
-app.delete("/user/projects", dataDeleteLimiter);
-app.delete("/user/tabular-reviews", dataDeleteLimiter);
-
-app.use((req, res, next) =>
-  express.json({ limit: jsonLimitForPath(req.path) })(req, res, next),
-);
-
-app.use("/chat", chatRouter);
-app.use("/projects", projectsRouter);
-app.use("/projects/:projectId/chat", projectChatRouter);
-app.use("/single-documents", documentsRouter);
-app.use("/tabular-review", tabularRouter);
-app.use("/workflows", workflowsRouter);
-app.use("/user", userRouter);
-app.use("/users", userRouter);
-app.use("/download", downloadsRouter);
-app.use("/case-law", caseLawRouter);
-
-app.get("/health", (_req, res) => res.json({ ok: true }));
-
-app.listen(PORT, () => {
-  console.log(`Mike backend running on port ${PORT}`);
-});
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
+process.on("SIGINT", () => void shutdown("SIGINT"));

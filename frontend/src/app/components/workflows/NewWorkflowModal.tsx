@@ -1,19 +1,28 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
-import { MessageSquare, Table2, Upload } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Upload } from "lucide-react";
 import { createWorkflow, updateWorkflow } from "@/app/lib/mikeApi";
+import { userFacingApiError } from "@/app/lib/userFacingError";
 import type { Workflow } from "../shared/types";
 import { PRACTICE_OPTIONS } from "./practices";
 import { Modal } from "../modals/Modal";
-import { ModalFieldLabel } from "../modals/ModalFieldLabel";
 import { ModalSegmentedToggle } from "../modals/ModalSegmentedToggle";
 import { ModalSelect } from "../modals/ModalSelect";
-import { ModalTextInput } from "../modals/ModalTextInput";
+import { FieldLabel, FormTextInput } from "../ui/form-field";
+import { WorkflowSlashCommandUI } from "@/shared/ui/WorkflowSlashCommandUI";
+import {
+    ChatSkeuoIcon,
+    TabularReviewSkeuoIcon,
+} from "../shared/AppSidebarSkeuoIcons";
+import {
+    COUNTRY_OPTIONS,
+    OTHER_JURISDICTION_OPTION,
+} from "@/app/onboarding/options";
 
 const DEFAULT_LANGUAGE = "English";
-const DEFAULT_PRACTICE = "General Transactions";
-const DEFAULT_JURISDICTION = "General";
+const DEFAULT_PRACTICE = "";
+const DEFAULT_JURISDICTION = "";
 const LANGUAGE_OPTIONS = [
     "English",
     "Chinese",
@@ -57,38 +66,8 @@ const LANGUAGE_OPTIONS = [
     "Other",
 ] as const;
 const JURISDICTION_OPTIONS = [
-    "General",
-    "United States",
-    "England and Wales",
-    "European Union",
-    "Singapore",
-    "Hong Kong",
-    "Australia",
-    "Canada",
-    "India",
-    "Malaysia",
-    "Indonesia",
-    "Philippines",
-    "Thailand",
-    "Vietnam",
-    "Japan",
-    "South Korea",
-    "China",
-    "Taiwan",
-    "Germany",
-    "France",
-    "Netherlands",
-    "Ireland",
-    "Scotland",
-    "Luxembourg",
-    "Switzerland",
-    "Cayman Islands",
-    "British Virgin Islands",
-    "United Arab Emirates",
-    "Saudi Arabia",
-    "Brazil",
-    "Mexico",
-    "Other",
+    ...COUNTRY_OPTIONS,
+    OTHER_JURISDICTION_OPTION,
 ] as const;
 const US_STATE_OPTIONS = [
     "Alabama",
@@ -164,14 +143,15 @@ interface Props {
     onClose: () => void;
     onCreated: (workflow: Workflow) => void;
     editWorkflow?: Workflow;
+    readOnly?: boolean;
     onUpdated?: (workflow: Workflow) => void;
 }
-
 export function NewWorkflowModal({
     open,
     onClose,
     onCreated,
     editWorkflow,
+    readOnly = false,
     onUpdated,
 }: Props) {
     const [title, setTitle] = useState("");
@@ -199,6 +179,7 @@ export function NewWorkflowModal({
     const markdownInputRef = useRef<HTMLInputElement>(null);
 
     const isEditing = !!editWorkflow;
+    const viewOnly = isEditing && readOnly;
     const isOtherLanguage = language === "Other";
     const isOtherPractice = practice === "Other";
     const isOtherJurisdiction = jurisdiction === "Other";
@@ -229,6 +210,31 @@ export function NewWorkflowModal({
         .split(",")
         .map((item) => item.trim())
         .filter(Boolean);
+    const hasChanges = useMemo(() => {
+        if (!editWorkflow) return true;
+
+        const initialLanguage = editWorkflow.metadata.language ?? DEFAULT_LANGUAGE;
+        const initialPractice = editWorkflow.metadata.practice?.trim() || null;
+        const initialJurisdictions =
+            editWorkflow.metadata.jurisdictions
+                ?.map((item) => item.trim())
+                .filter(Boolean) ?? [];
+
+        return (
+            title.trim() !== editWorkflow.metadata.title.trim() ||
+            (effectiveLanguage.trim() || null) !==
+                (initialLanguage.trim() || null) ||
+            effectivePractice !== initialPractice ||
+            JSON.stringify(effectiveJurisdictions) !==
+                JSON.stringify(initialJurisdictions)
+        );
+    }, [
+        editWorkflow,
+        effectiveJurisdictions,
+        effectiveLanguage,
+        effectivePractice,
+        title,
+    ]);
     const formId = "workflow-modal-form";
 
     const resetForm = useCallback(() => {
@@ -332,6 +338,7 @@ export function NewWorkflowModal({
 
     async function handleSubmit(e: React.FormEvent) {
         e.preventDefault();
+        if (viewOnly) return;
         if (!title.trim()) return;
         setLoading(true);
         setError("");
@@ -369,7 +376,12 @@ export function NewWorkflowModal({
             resetForm();
             onClose();
         } catch (err: unknown) {
-            setError((err as Error).message || `Failed to ${isEditing ? "update" : "create"} workflow`);
+            setError(
+                userFacingApiError(
+                    err,
+                    `Failed to ${isEditing ? "update" : "create"} workflow`,
+                ),
+            );
         } finally {
             setLoading(false);
         }
@@ -417,20 +429,27 @@ export function NewWorkflowModal({
             onClose={handleClose}
             breadcrumbs={[
                 "Workflows",
-                isEditing ? "Edit workflow" : "New workflow",
+                isEditing ? "View and Edit details" : "New workflow",
             ]}
-            primaryAction={{
-                label: loading
-                    ? isEditing
-                        ? "Saving…"
-                        : "Creating…"
-                    : isEditing
-                      ? "Save changes"
-                      : "Create workflow",
-                type: "submit",
-                form: formId,
-                disabled: !title.trim() || loading,
-            }}
+            primaryAction={
+                viewOnly
+                    ? undefined
+                    : {
+                          label: loading
+                              ? isEditing
+                                  ? "Saving…"
+                                  : "Creating…"
+                              : isEditing
+                                ? "Save"
+                                : "Create workflow",
+                          type: "submit",
+                          form: formId,
+                          disabled:
+                              !title.trim() ||
+                              loading ||
+                              (isEditing && !hasChanges),
+                      }
+            }
             secondaryAction={
                 !isEditing && type === "assistant"
                     ? {
@@ -445,27 +464,29 @@ export function NewWorkflowModal({
             <form
                 id={formId}
                 onSubmit={handleSubmit}
-                className="flex min-h-0 flex-1 flex-col"
+                className="-mx-2 flex min-h-0 flex-1 flex-col overflow-y-auto px-2 pb-5"
             >
                 <div className="space-y-6">
                     <div>
-                        <ModalFieldLabel htmlFor="workflow-title">
+                        <FieldLabel htmlFor="workflow-title">
                             Title
-                        </ModalFieldLabel>
-                        <ModalTextInput
+                        </FieldLabel>
+                        <FormTextInput
                             id="workflow-title"
                             type="text"
                             value={title}
                             onChange={(e) => setTitle(e.target.value)}
                             placeholder="Add workflow name"
                             variant="minimal"
-                            autoFocus
+                            disabled={viewOnly}
+                            autoFocus={!viewOnly}
                         />
+                        <WorkflowSlashCommandUI title={title} />
                     </div>
 
                     {!isEditing && (
                         <div>
-                            <ModalFieldLabel as="p">Type</ModalFieldLabel>
+                            <FieldLabel as="p">Type</FieldLabel>
                             <ModalSegmentedToggle
                                 value={type}
                                 onChange={setType}
@@ -473,12 +494,12 @@ export function NewWorkflowModal({
                                     {
                                         value: "assistant",
                                         label: "Assistant",
-                                        icon: MessageSquare,
+                                        icon: ChatSkeuoIcon,
                                     },
                                     {
                                         value: "tabular",
                                         label: "Tabular",
-                                        icon: Table2,
+                                        icon: TabularReviewSkeuoIcon,
                                     },
                                 ]}
                             />
@@ -487,13 +508,14 @@ export function NewWorkflowModal({
 
                     <div className="grid gap-5 md:grid-cols-2">
                         <div>
-                            <ModalFieldLabel htmlFor="workflow-language">
+                            <FieldLabel htmlFor="workflow-language">
                                 Language
-                            </ModalFieldLabel>
+                            </FieldLabel>
                             <ModalSelect
                                 id="workflow-language"
                                 value={language}
                                 options={languageOptions}
+                                disabled={viewOnly}
                                 open={openDropdown === "language"}
                                 onOpenChange={(nextOpen) =>
                                     setOpenDropdown((current) =>
@@ -513,10 +535,11 @@ export function NewWorkflowModal({
                                 }}
                             />
                             {isOtherLanguage && (
-                                <ModalTextInput
+                                <FormTextInput
                                     ref={customLanguageInputRef}
                                     type="text"
                                     value={customLanguage}
+                                    disabled={viewOnly}
                                     onChange={(e) =>
                                         setCustomLanguage(e.target.value)
                                     }
@@ -527,13 +550,15 @@ export function NewWorkflowModal({
                         </div>
 
                         <div>
-                            <ModalFieldLabel htmlFor="workflow-practice">
+                            <FieldLabel htmlFor="workflow-practice">
                                 Practice area
-                            </ModalFieldLabel>
+                            </FieldLabel>
                             <ModalSelect
                                 id="workflow-practice"
                                 value={practice}
                                 options={PRACTICE_OPTIONS}
+                                placeholder="Select practice area"
+                                disabled={viewOnly}
                                 open={openDropdown === "practice"}
                                 onOpenChange={(nextOpen) =>
                                     setOpenDropdown((current) =>
@@ -553,10 +578,11 @@ export function NewWorkflowModal({
                                 }}
                             />
                             {isOtherPractice && (
-                                <ModalTextInput
+                                <FormTextInput
                                     ref={customInputRef}
                                     type="text"
                                     value={customPractice}
+                                    disabled={viewOnly}
                                     onChange={(e) =>
                                         setCustomPractice(e.target.value)
                                     }
@@ -568,13 +594,15 @@ export function NewWorkflowModal({
                     </div>
 
                     <div>
-                        <ModalFieldLabel htmlFor="workflow-jurisdiction">
+                        <FieldLabel htmlFor="workflow-jurisdiction">
                             Jurisdiction
-                        </ModalFieldLabel>
+                        </FieldLabel>
                         <ModalSelect
                             id="workflow-jurisdiction"
                             value={jurisdiction}
                             options={jurisdictionOptions}
+                            placeholder="Select jurisdiction"
+                            disabled={viewOnly}
                             open={openDropdown === "jurisdiction"}
                             onOpenChange={(nextOpen) =>
                                 setOpenDropdown((current) =>
@@ -600,6 +628,7 @@ export function NewWorkflowModal({
                                 className="mt-2"
                                 value={jurisdictionRegion}
                                 options={jurisdictionRegionOptions}
+                                disabled={viewOnly}
                                 placeholder={
                                     jurisdiction === "United States"
                                         ? "Select state..."
@@ -622,10 +651,11 @@ export function NewWorkflowModal({
                             />
                         )}
                         {isOtherJurisdiction && (
-                            <ModalTextInput
+                            <FormTextInput
                                 ref={customJurisdictionInputRef}
                                 type="text"
                                 value={customJurisdiction}
+                                disabled={viewOnly}
                                 onChange={(e) =>
                                     setCustomJurisdiction(e.target.value)
                                 }

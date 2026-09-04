@@ -7,17 +7,13 @@ import {
     useState,
     type CSSProperties,
 } from "react";
+import Image from "next/image";
 import { X } from "lucide-react";
 import { DocPanel, type DocPanelMode } from "./DocPanel";
-import type {
-    Citation,
-    EditAnnotation,
-} from "../shared/types";
-import {
-    CaseLawPanel,
-    type CaseTab,
-} from "./CaseLawPanel";
+import { FileTypeIcon } from "../shared/FileTypeIcon";
+import type { Citation, EditAnnotation, PanelDocument } from "../shared/types";
 import { cn } from "@/app/lib/utils";
+import { LIQUID_GLASS_FLOAT_CLASS } from "@/app/components/ui/liquid-surface";
 
 // ---------------------------------------------------------------------------
 // Tab data
@@ -33,10 +29,7 @@ import { cn } from "@/app/lib/utils";
 
 type CommonTab = {
     id: string;
-    documentId: string;
-    filename: string;
-    versionId: string | null;
-    versionNumber: number | null;
+    document: PanelDocument;
     warning?: string | null;
     initialScrollTop?: number | null;
 };
@@ -54,11 +47,90 @@ export type EditTab = CommonTab & {
     changeNumber?: number;
 };
 
-export type AssistantSidePanelTab =
-    | DocumentTab
-    | CitationTab
-    | EditTab
-    | CaseTab;
+export type AssistantSidePanelTab = DocumentTab | CitationTab | EditTab;
+
+/**
+ * A document version owns one panel tab. Explicit versions use their stable
+ * version id; older links without one fall back to the version number and then
+ * to the document's current version.
+ */
+export function assistantSidePanelTabId(document: PanelDocument): string {
+    const version = document.version_id
+        ? `id:${document.version_id}`
+        : document.version_number != null
+          ? `number:${document.version_number}`
+          : "current";
+    return `${document.document_id}::${version}`;
+}
+
+export function mergeAssistantSidePanelTab(
+    existing: AssistantSidePanelTab,
+    incoming: AssistantSidePanelTab,
+): AssistantSidePanelTab {
+    if (existing.id !== incoming.id) {
+        return incoming;
+    }
+    if (existing.kind === "document" && incoming.kind === "document") {
+        if (
+            incoming.document.subdocuments?.length &&
+            !existing.document.subdocuments?.length
+        ) {
+            return {
+                ...existing,
+                document: incoming.document,
+            };
+        }
+        return existing;
+    }
+    return {
+        ...incoming,
+        id: existing.id,
+        warning: existing.warning,
+        initialScrollTop: existing.initialScrollTop,
+    };
+}
+
+export function upsertAssistantSidePanelTab(
+    tabs: AssistantSidePanelTab[],
+    incoming: AssistantSidePanelTab,
+): AssistantSidePanelTab[] {
+    const index = tabs.findIndex((tab) => tab.id === incoming.id);
+    if (index < 0) return [...tabs, incoming];
+
+    const existing = tabs[index];
+    const merged = mergeAssistantSidePanelTab(existing, incoming);
+    if (merged === existing) return tabs;
+
+    const next = tabs.slice();
+    next[index] = merged;
+    return next;
+}
+
+export type AssistantTabDropPosition = "before" | "after";
+
+export function reorderAssistantSidePanelTabs(
+    tabs: AssistantSidePanelTab[],
+    draggedTabId: string,
+    targetTabId: string,
+    position: AssistantTabDropPosition,
+): AssistantSidePanelTab[] {
+    const draggedIndex = tabs.findIndex((tab) => tab.id === draggedTabId);
+    const targetIndex = tabs.findIndex((tab) => tab.id === targetTabId);
+    if (draggedIndex < 0 || targetIndex < 0 || draggedTabId === targetTabId) {
+        return tabs;
+    }
+
+    const next = tabs.slice();
+    const [draggedTab] = next.splice(draggedIndex, 1);
+    const remainingTargetIndex = next.findIndex(
+        (tab) => tab.id === targetTabId,
+    );
+    const insertionIndex =
+        position === "after" ? remainingTargetIndex + 1 : remainingTargetIndex;
+    next.splice(insertionIndex, 0, draggedTab);
+
+    return next.every((tab, index) => tab === tabs[index]) ? tabs : next;
+}
 
 interface Props {
     tabs: AssistantSidePanelTab[];
@@ -66,6 +138,11 @@ interface Props {
     onActivateTab: (id: string) => void;
     onCloseTab: (id: string) => void;
     onCloseAll: () => void;
+    onReorderTabs?: (
+        draggedTabId: string,
+        targetTabId: string,
+        position: AssistantTabDropPosition,
+    ) => void;
     /**
      * Parent-driven reloading flag per document. Download buttons in
      * DocPanel show a spinner iff this returns true for the tab's
@@ -103,7 +180,6 @@ interface Props {
 const MIN_WIDTH = 300;
 const MAX_WIDTH_OFFSET = 56; // sidebar width
 const MIN_CHAT_WIDTH = 400;
-
 function maxPanelWidth() {
     if (typeof window === "undefined") return 600;
     return Math.max(
@@ -113,10 +189,7 @@ function maxPanelWidth() {
 }
 
 function tabTitle(tab: AssistantSidePanelTab): string {
-    if (tab.kind === "case") {
-        return tab.caseName || tab.citation || "Case";
-    }
-    return tab.filename;
+    return tab.document.title;
 }
 
 export function AssistantSidePanel({
@@ -125,6 +198,7 @@ export function AssistantSidePanel({
     onActivateTab,
     onCloseTab,
     onCloseAll,
+    onReorderTabs,
     isEditorReloading,
     isEditReloading,
     onEditResolveStart,
@@ -145,6 +219,18 @@ export function AssistantSidePanel({
 
     const dragStartX = useRef<number>(0);
     const dragStartWidth = useRef<number>(0);
+    const draggedTabIdRef = useRef<string | null>(null);
+    const [draggedTabId, setDraggedTabId] = useState<string | null>(null);
+    const [dropTarget, setDropTarget] = useState<{
+        tabId: string;
+        position: AssistantTabDropPosition;
+    } | null>(null);
+
+    const clearTabDrag = useCallback(() => {
+        draggedTabIdRef.current = null;
+        setDraggedTabId(null);
+        setDropTarget(null);
+    }, []);
 
     const onMouseDown = useCallback(
         (e: React.MouseEvent) => {
@@ -190,17 +276,22 @@ export function AssistantSidePanel({
 
     const active = tabs.find((t) => t.id === activeTabId) ?? tabs[0] ?? null;
     if (!active) return null;
+    const lastTab = tabs[tabs.length - 1];
 
     return (
         <div
             ref={panelRef}
             className={cn(
                 "relative flex h-full w-full shrink-0 flex-col md:my-3 md:mr-3 md:h-[calc(100%-1.5rem)] md:w-[var(--assistant-panel-width)]",
-                "rounded-2xl border border-white/70 bg-white shadow-[0_6px_18px_rgba(15,23,42,0.08),inset_0_1px_0_rgba(255,255,255,0.9),inset_0_-10px_24px_rgba(255,255,255,0.18),inset_1px_0_0_rgba(255,255,255,0.5)] backdrop-blur-2xl overflow-hidden",
+                "rounded-2xl backdrop-blur-2xl",
+                LIQUID_GLASS_FLOAT_CLASS,
+                "overflow-hidden",
             )}
-            style={{
-                "--assistant-panel-width": `${panelWidth}px`,
-            } as CSSProperties}
+            style={
+                {
+                    "--assistant-panel-width": `${panelWidth}px`,
+                } as CSSProperties
+            }
         >
             {/* Drag handle */}
             <div
@@ -215,47 +306,149 @@ export function AssistantSidePanel({
             {/* Tab strip (Chrome-style) */}
             <div
                 className={cn(
-                    "flex items-end gap-1 px-1 pt-2",
-                    "bg-gray-200/80",
+                    "document-tab-strip flex items-end gap-1 px-1 pt-2",
                 )}
             >
                 <div className="flex-1 flex items-end gap-1 overflow-hidden px-2">
                     {tabs.map((tab) => {
                         const isActive = tab.id === active.id;
                         const showVersionBadge =
-                            tab.kind !== "case" &&
-                            typeof tab.versionNumber === "number" &&
-                            Number.isFinite(tab.versionNumber) &&
-                            tab.versionNumber > 1;
+                            typeof tab.document.version_number === "number" &&
+                            Number.isFinite(tab.document.version_number) &&
+                            tab.document.version_number > 1;
                         const title = tabTitle(tab);
                         return (
                             <div
                                 key={tab.id}
+                                draggable={!!onReorderTabs && tabs.length > 1}
+                                onDragStart={(event) => {
+                                    if (!onReorderTabs) return;
+                                    draggedTabIdRef.current = tab.id;
+                                    setDraggedTabId(tab.id);
+                                    event.dataTransfer.effectAllowed = "move";
+                                    event.dataTransfer.setData(
+                                        "text/plain",
+                                        tab.id,
+                                    );
+                                }}
+                                onDragOver={(event) => {
+                                    const draggedId =
+                                        draggedTabIdRef.current ??
+                                        event.dataTransfer.getData(
+                                            "text/plain",
+                                        );
+                                    if (!onReorderTabs || !draggedId) {
+                                        return;
+                                    }
+                                    if (draggedId === tab.id) {
+                                        setDropTarget(null);
+                                        return;
+                                    }
+                                    event.preventDefault();
+                                    event.dataTransfer.dropEffect = "move";
+                                    const rect =
+                                        event.currentTarget.getBoundingClientRect();
+                                    const position =
+                                        event.clientX <
+                                        rect.left + rect.width / 2
+                                            ? "before"
+                                            : "after";
+                                    setDropTarget((current) =>
+                                        current?.tabId === tab.id &&
+                                        current.position === position
+                                            ? current
+                                            : { tabId: tab.id, position },
+                                    );
+                                }}
+                                onDrop={(event) => {
+                                    event.preventDefault();
+                                    event.stopPropagation();
+                                    const draggedId =
+                                        draggedTabIdRef.current ??
+                                        event.dataTransfer.getData(
+                                            "text/plain",
+                                        );
+                                    if (
+                                        onReorderTabs &&
+                                        draggedId &&
+                                        draggedId !== tab.id
+                                    ) {
+                                        const rect =
+                                            event.currentTarget.getBoundingClientRect();
+                                        onReorderTabs(
+                                            draggedId,
+                                            tab.id,
+                                            event.clientX <
+                                                rect.left + rect.width / 2
+                                                ? "before"
+                                                : "after",
+                                        );
+                                    }
+                                    clearTabDrag();
+                                }}
+                                onDragEnd={clearTabDrag}
                                 onClick={() => onActivateTab(tab.id)}
+                                data-active={isActive ? "true" : "false"}
                                 className={cn(
-                                    "group relative flex items-center gap-1.5 pl-3 pr-1.5 h-8 min-w-0 max-w-[220px] rounded-t-lg cursor-pointer select-none transition-colors",
-                                    isActive
-                                        ? "z-20 bg-white text-gray-800 before:content-[''] before:absolute before:bottom-0 before:-left-2 before:z-20 before:h-2 before:w-2 before:rounded-br-lg before:shadow-[4px_4px_0_4px_white] before:transition-shadow after:content-[''] after:absolute after:bottom-0 after:-right-2 after:z-20 after:h-2 after:w-2 after:rounded-bl-lg after:shadow-[-4px_4px_0_4px_white] after:transition-shadow"
-                                        : "z-10 bg-gray-100 text-gray-600 hover:bg-gray-100 before:content-[''] before:absolute before:bottom-0 before:-left-2 before:h-2 before:w-2 before:rounded-br-lg before:shadow-[4px_4px_0_4px_#f3f4f6] before:transition-shadow after:content-[''] after:absolute after:bottom-0 after:-right-2 after:h-2 after:w-2 after:rounded-bl-lg after:shadow-[-4px_4px_0_4px_#f3f4f6] after:transition-shadow",
+                                    "document-tab group relative flex items-center gap-1.5 pl-3 pr-1.5 h-8 min-w-0 max-w-[220px] rounded-t-lg cursor-pointer select-none transition-colors",
+                                    isActive ? "z-20" : "z-10",
+                                    onReorderTabs && tabs.length > 1
+                                        ? "cursor-grab active:cursor-grabbing"
+                                        : "",
+                                    draggedTabId === tab.id ? "opacity-55" : "",
                                 )}
                             >
-                                <span
-                                    className={`min-w-0 flex-1 truncate text-xs ${isActive ? "font-medium" : "font-normal"}`}
-                                    title={title}
-                                >
-                                    {title}
-                                </span>
-                                {showVersionBadge && (
+                                {dropTarget?.tabId === tab.id &&
+                                    draggedTabId !== tab.id && (
+                                        <span
+                                            aria-hidden="true"
+                                            className={cn(
+                                                "pointer-events-none absolute inset-y-1 z-30 w-0.5 rounded-full bg-blue-500",
+                                                dropTarget.position === "before"
+                                                    ? "left-0"
+                                                    : "right-0",
+                                            )}
+                                        />
+                                    )}
+                                <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden">
+                                    {tab.document.type === "case" ||
+                                    tab.document.type === "legislation" ? (
+                                        <Image
+                                            src={
+                                                tab.document.type === "case"
+                                                    ? "/icons/legal-sources/case-law.svg"
+                                                    : "/icons/legal-sources/legislation.svg"
+                                            }
+                                            alt=""
+                                            aria-hidden="true"
+                                            width={14}
+                                            height={14}
+                                            className="h-3.5 w-3.5 shrink-0 object-contain"
+                                        />
+                                    ) : (
+                                        <FileTypeIcon
+                                            fileType={tab.document.title}
+                                            className="h-3.5 w-3.5 shrink-0"
+                                        />
+                                    )}
                                     <span
-                                        className={`shrink-0 inline-flex items-center rounded border px-1 py-px text-[9px] font-medium ${
-                                            isActive
-                                                ? "border-gray-200 bg-white text-gray-600"
-                                                : "border-gray-300 bg-white/70 text-gray-500"
-                                        }`}
+                                        className={`min-w-0 flex-1 truncate text-xs ${isActive ? "font-medium" : "font-normal"}`}
+                                        title={title}
                                     >
-                                        V{tab.versionNumber}
+                                        {title}
                                     </span>
-                                )}
+                                    {showVersionBadge && (
+                                        <span
+                                            className={`inline-flex shrink-0 items-center rounded border px-1 py-px text-[9px] font-medium ${
+                                                isActive
+                                                    ? "border-gray-200 bg-white text-gray-600"
+                                                    : "border-gray-300 bg-white/70 text-gray-500"
+                                            }`}
+                                        >
+                                            V{tab.document.version_number}
+                                        </span>
+                                    )}
+                                </div>
                                 <button
                                     onClick={(e) => {
                                         e.stopPropagation();
@@ -268,6 +461,41 @@ export function AssistantSidePanel({
                             </div>
                         );
                     })}
+                    <div
+                        className="h-8 min-w-4 flex-1"
+                        onDragOver={(event) => {
+                            const draggedId =
+                                draggedTabIdRef.current ??
+                                event.dataTransfer.getData("text/plain");
+                            if (!onReorderTabs || !draggedId) return;
+
+                            event.preventDefault();
+                            event.dataTransfer.dropEffect = "move";
+                            setDropTarget(
+                                draggedId === lastTab.id
+                                    ? null
+                                    : {
+                                          tabId: lastTab.id,
+                                          position: "after",
+                                      },
+                            );
+                        }}
+                        onDrop={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            const draggedId =
+                                draggedTabIdRef.current ??
+                                event.dataTransfer.getData("text/plain");
+                            if (
+                                onReorderTabs &&
+                                draggedId &&
+                                draggedId !== lastTab.id
+                            ) {
+                                onReorderTabs(draggedId, lastTab.id, "after");
+                            }
+                            clearTabDrag();
+                        }}
+                    />
                 </div>
                 <button
                     onClick={onCloseAll}
@@ -284,20 +512,6 @@ export function AssistantSidePanel({
             <div className="flex-1 min-h-0 relative">
                 {tabs.map((tab) => {
                     const isActive = tab.id === active.id;
-                    if (tab.kind === "case") {
-                        return (
-                            <div
-                                key={tab.id}
-                                className={`absolute inset-0 flex flex-col ${isActive ? "" : "invisible pointer-events-none"}`}
-                                aria-hidden={!isActive}
-                            >
-                                <CaseLawPanel
-                                    tab={tab}
-                                    compactActions={panelWidth < 600}
-                                />
-                            </div>
-                        );
-                    }
                     const mode: DocPanelMode =
                         tab.kind === "citation"
                             ? {
@@ -324,14 +538,14 @@ export function AssistantSidePanel({
                             aria-hidden={!isActive}
                         >
                             <DocPanel
-                                documentId={tab.documentId}
-                                filename={tab.filename}
-                                versionId={tab.versionId}
-                                versionNumber={tab.versionNumber}
+                                document={tab.document}
                                 mode={mode}
                                 isReloading={
-                                    isEditorReloading?.(tab.documentId) ?? false
+                                    isEditorReloading?.(
+                                        tab.document.document_id,
+                                    ) ?? false
                                 }
+                                compactActions={panelWidth < 600}
                                 warning={tab.warning ?? null}
                                 onWarningDismiss={() =>
                                     onWarningDismiss?.(tab.id)
